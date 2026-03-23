@@ -1,13 +1,19 @@
+mod function;
+mod router;
+mod stream;
+
 use {
     postcard::{from_bytes, to_allocvec},
     serde::{Deserialize, Serialize},
     std::{
-        any::type_name,
+        fmt::Debug,
         io::{Error as IoError, Result as IoResult},
         ops::{Deref, DerefMut},
     },
     tokio_tungstenite::tungstenite::Message,
 };
+
+pub use {function::*, router::*, stream::*};
 
 /// Request ID type based on selected feature flag
 /// Priority: u64 > u32 > u16 > u8 (default)
@@ -81,6 +87,11 @@ impl<A, B> Packet<A, B> {
     }
 }
 
+/// A wrapper type that provides accessor functionality for connection types.
+///
+/// This type wraps inner connection types and provides deref access
+/// to the underlying connection data.
+#[derive(Debug)]
 pub struct Accessor<I> {
     inner: I,
 }
@@ -103,114 +114,6 @@ impl<I> From<I> for Accessor<I> {
         Self { inner }
     }
 }
-
-pub trait Router<Acc> {
-    fn add_route<F, P, Args, Ret>(&self, path: P, handler: F) -> impl Future<Output = IoResult<()>>
-    where
-        F: AsyncFun<Args, Ret, Acc>,
-        Args: for<'a> Deserialize<'a> + Serialize,
-        Ret: for<'a> Deserialize<'a> + Serialize + Send,
-        P: AsRef<str>;
-
-    fn remove_route<P>(&self, path: P) -> impl Future<Output = IoResult<()>>
-    where
-        P: AsRef<str>;
-}
-
-pub trait AsyncFun<Args, Ret, Acc>
-where
-    Self: Copy + Send + 'static,
-{
-    fn bind_by_path<R, P>(self, router: &R, path: P) -> impl Future<Output = IoResult<()>>
-    where
-        R: Router<Acc>,
-        P: AsRef<str> + Send + Sync + 'static,
-        Args: for<'a> Deserialize<'a> + Serialize,
-        Ret: for<'a> Deserialize<'a> + Serialize + Send,
-    {
-        router.add_route::<_, _, Args, Ret>(path, self)
-    }
-
-    fn bind<R>(self, router: &R) -> impl Future<Output = IoResult<()>>
-    where
-        R: Router<Acc>,
-        Args: for<'a> Deserialize<'a> + Serialize,
-        Ret: for<'a> Deserialize<'a> + Serialize + Send,
-    {
-        router.add_route::<_, _, Args, Ret>(<Self as AsyncFun<Args, Ret, Acc>>::get_path(), self)
-    }
-
-    fn unbind_by_path<R, P>(self, router: &R, path: P) -> impl Future<Output = IoResult<()>>
-    where
-        R: Router<Acc>,
-        P: AsRef<str> + Send + Sync + 'static,
-    {
-        router.remove_route(path)
-    }
-
-    fn unbind<R>(self, router: &R) -> impl Future<Output = IoResult<()>>
-    where
-        R: Router<Acc>,
-    {
-        router.remove_route(Self::get_path())
-    }
-
-    fn get_path() -> String {
-        format!(
-            "/{}",
-            type_name::<Self>()
-                .split("::")
-                .last()
-                .unwrap_or("")
-                .replace("_", "/")
-        )
-    }
-
-    fn call(self, accessor: Acc, args: Args) -> impl Future<Output = Ret> + Send;
-}
-
-macro_rules! impl_async_fun {
-    ($($t:ident : $T:ident),* $(,)?) => {
-        impl<Fun, Fut, Ret, Acc, $($T,)*> AsyncFun<($($T,)*), Ret, Acc> for Fun
-        where
-            Fut: Future<Output = Ret> + Send + 'static,
-            Fun: Fn(Accessor<Acc>, $($T,)*) -> Fut + Copy + Send + 'static,
-            $($T: Send,)*
-        {
-            fn call(self, accessor: Acc, ($($t,)*): ($($T,)*)) -> impl Future<Output = Ret> + Send {
-                self(accessor.into(), $($t),*)
-            }
-        }
-    }
-}
-
-impl_async_fun!();
-impl_async_fun!(a: A);
-impl_async_fun!(a: A, b: B);
-impl_async_fun!(a: A, b: B, c: C);
-impl_async_fun!(a: A, b: B, c: C, d: D);
-impl_async_fun!(a: A, b: B, c: C, d: D, e: E);
-impl_async_fun!(a: A, b: B, c: C, d: D, e: E, f: F);
-impl_async_fun!(a: A, b: B, c: C, d: D, e: E, f: F, g: G);
-impl_async_fun!(a: A, b: B, c: C, d: D, e: E, f: F, g: G, h: H);
-impl_async_fun!(a: A, b: B, c: C, d: D, e: E, f: F, g: G, h: H, i: I);
-impl_async_fun!(a: A, b: B, c: C, d: D, e: E, f: F, g: G, h: H, i: I, j: J);
-impl_async_fun!(a: A, b: B, c: C, d: D, e: E, f: F, g: G, h: H, i: I, j: J, k: K);
-impl_async_fun!(a: A, b: B, c: C, d: D, e: E, f: F, g: G, h: H, i: I, j: J, k: K, l: L);
-impl_async_fun!(a: A, b: B, c: C, d: D, e: E, f: F, g: G, h: H, i: I, j: J, k: K, l: L, m: M);
-impl_async_fun!(a: A, b: B, c: C, d: D, e: E, f: F, g: G, h: H, i: I, j: J, k: K, l: L, m: M, n: N);
-impl_async_fun!(a: A, b: B, c: C, d: D, e: E, f: F, g: G, h: H, i: I, j: J, k: K, l: L, m: M, n: N, o: O);
-impl_async_fun!(a: A, b: B, c: C, d: D, e: E, f: F, g: G, h: H, i: I, j: J, k: K, l: L, m: M, n: N, o: O, p: P);
-impl_async_fun!(a: A, b: B, c: C, d: D, e: E, f: F, g: G, h: H, i: I, j: J, k: K, l: L, m: M, n: N, o: O, p: P, q: Q);
-impl_async_fun!(a: A, b: B, c: C, d: D, e: E, f: F, g: G, h: H, i: I, j: J, k: K, l: L, m: M, n: N, o: O, p: P, q: Q, r: R);
-impl_async_fun!(a: A, b: B, c: C, d: D, e: E, f: F, g: G, h: H, i: I, j: J, k: K, l: L, m: M, n: N, o: O, p: P, q: Q, r: R, s: S);
-impl_async_fun!(a: A, b: B, c: C, d: D, e: E, f: F, g: G, h: H, i: I, j: J, k: K, l: L, m: M, n: N, o: O, p: P, q: Q, r: R, s: S, t: T);
-impl_async_fun!(a: A, b: B, c: C, d: D, e: E, f: F, g: G, h: H, i: I, j: J, k: K, l: L, m: M, n: N, o: O, p: P, q: Q, r: R, s: S, t: T, u: U);
-impl_async_fun!(a: A, b: B, c: C, d: D, e: E, f: F, g: G, h: H, i: I, j: J, k: K, l: L, m: M, n: N, o: O, p: P, q: Q, r: R, s: S, t: T, u: U, v: V);
-impl_async_fun!(a: A, b: B, c: C, d: D, e: E, f: F, g: G, h: H, i: I, j: J, k: K, l: L, m: M, n: N, o: O, p: P, q: Q, r: R, s: S, t: T, u: U, v: V, w: W);
-impl_async_fun!(a: A, b: B, c: C, d: D, e: E, f: F, g: G, h: H, i: I, j: J, k: K, l: L, m: M, n: N, o: O, p: P, q: Q, r: R, s: S, t: T, u: U, v: V, w: W, x: X);
-impl_async_fun!(a: A, b: B, c: C, d: D, e: E, f: F, g: G, h: H, i: I, j: J, k: K, l: L, m: M, n: N, o: O, p: P, q: Q, r: R, s: S, t: T, u: U, v: V, w: W, x: X, y: Y);
-impl_async_fun!(a: A, b: B, c: C, d: D, e: E, f: F, g: G, h: H, i: I, j: J, k: K, l: L, m: M, n: N, o: O, p: P, q: Q, r: R, s: S, t: T, u: U, v: V, w: W, x: X, y: Y, z: Z);
 
 #[cfg(test)]
 mod tests {

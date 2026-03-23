@@ -1,167 +1,193 @@
+mod binding;
+mod caller;
+mod command;
+mod conn;
+mod handler;
+mod request;
+
 use {
-    super::types::{Accessor, AsyncFun, AtomicReqId, Packet, ReqId, Router},
-    futures_util::{
-        SinkExt, StreamExt,
-        future::{Either, select},
+    super::{
+        types::{Accessor, HttpClientAsyncFn, HttpClientRouter, WsAsyncFn, WsRouter},
+        utils::build_uri,
     },
+    binding::{HttpBinding, WsBinding},
+    caller::WS_BINDING_SENDERS,
+    command::Command,
+    conn::{RequestConn, ResponseConn},
+    handler::{HttpCall, http_dispatch, ws_dispatch_with_auto_reconnection},
+    hyper::http::Uri,
+    request::HTTP_BINDING_SENDERS,
     serde::{Deserialize, Serialize},
     std::{
-        any::type_name,
         collections::HashMap,
         io::{Error as IoError, ErrorKind, Result as IoResult},
-        sync::{LazyLock, atomic::Ordering},
+        sync::Arc,
+        time::Duration,
     },
     tokio::{
         runtime::{Builder, Runtime},
         sync::{
-            Mutex,
             mpsc::{Receiver as MpscReceiver, Sender as MpscSender, channel as mpsc_channel},
             oneshot::{Sender as OneshotSender, channel as oneshot_channel},
         },
         task::JoinHandle,
     },
-    tokio_tungstenite::{
-        connect_async,
-        tungstenite::{Message, client::IntoClientRequest},
-    },
     tracing::{error, info},
 };
+pub use {
+    caller::WsCaller,
+    conn::{HttpAccessor, RequestAccessor, WsAccessor},
+    request::{HttpDelete, HttpGet, HttpHead, HttpPatch, HttpPost, HttpPut},
+};
 
-static BIND_SENDERS: LazyLock<Mutex<HashMap<String, MpscSender<Command>>>> =
-    LazyLock::new(Default::default);
+/// Default configuration values
+const DEFAULT_NUM_WORKERS: usize = 4;
+const DEFAULT_MAX_RETRIES: usize = 3;
+const DEFAULT_RETRY_INTERVAL_MS: u64 = 1000;
 
-pub type ClientAccessor = Accessor<String>;
-
-#[derive(Debug)]
-enum Command {
-    AddRoute {
-        path: String,
-        stream: MpscSender<(ReqId, Message, OneshotSender<Message>)>,
-        task: JoinHandle<()>,
-        opt_return: OneshotSender<IoResult<()>>,
-    },
-
-    RemoveRoute {
-        path: String,
-        opt_return: OneshotSender<IoResult<()>>,
-    },
-
-    CallRemotely {
-        path: String,
-        id: ReqId,
-        msg: Message,
-        opt_return: OneshotSender<IoResult<Message>>,
-    },
+/// Builder for creating `EdgyClient` with custom configuration.
+///
+/// # Example
+/// ```no_run
+/// use edgy_s::EdgyClient;
+///
+/// let client = EdgyClient::builder("ws://localhost")
+///     .workers(2)
+///     .max_retries(5)
+///     .retry_interval_ms(500)
+///     .build()?;
+/// ```
+pub struct EdgyClientBuilder {
+    base_url: Uri,
+    num_workers: usize,
+    max_retries: usize,
+    retry_interval: Duration,
 }
 
-pub struct EdgyClient<U> {
-    base_url: U,
-    rt: Runtime,
+impl EdgyClientBuilder {
+    /// Sets the number of worker threads for the async runtime.
+    pub fn workers(mut self, num: usize) -> Self {
+        self.num_workers = num;
+        self
+    }
+
+    /// Sets the maximum number of reconnection attempts for WebSocket connections.
+    pub fn max_retries(mut self, num: usize) -> Self {
+        self.max_retries = num;
+        self
+    }
+
+    /// Sets the retry interval in milliseconds between reconnection attempts.
+    pub fn retry_interval_ms(mut self, ms: u64) -> Self {
+        self.retry_interval = Duration::from_millis(ms);
+        self
+    }
+
+    /// Sets the retry interval as a Duration.
+    pub fn retry_interval(mut self, duration: Duration) -> Self {
+        self.retry_interval = duration;
+        self
+    }
+
+    /// Builds the `EdgyClient` with the configured settings.
+    pub fn build(self) -> IoResult<EdgyClient> {
+        let rt = Builder::new_multi_thread()
+            .worker_threads(self.num_workers)
+            .enable_all()
+            .build()?;
+        let (tx, rx) = mpsc_channel(2);
+        let task = rt.spawn(EdgyClient::worker(rx));
+
+        Ok(EdgyClient {
+            base_url: self.base_url,
+            rt: rt.into(),
+            command: tx,
+            task: Some(task),
+            max_retries: self.max_retries,
+            retry_interval: self.retry_interval,
+        })
+    }
+}
+
+/// HTTP/WebSocket client for making requests and establishing WebSocket connections.
+///
+/// The client provides both HTTP request routing and WebSocket connection management
+/// with automatic reconnection support.
+///
+/// # Example
+/// ```no_run
+/// use edgy_s::EdgyClient;
+///
+/// #[tokio::main]
+/// async fn main() -> std::io::Result<()> {
+///     let client = EdgyClient::builder("ws://localhost:8080")
+///         .workers(2)
+///         .max_retries(5)
+///         .build()?;
+///     
+///     client.run().await
+/// }
+/// ```
+pub struct EdgyClient {
+    base_url: Uri,
+    rt: Arc<Runtime>,
     command: MpscSender<Command>,
     task: Option<JoinHandle<IoResult<()>>>,
+    max_retries: usize,
+    retry_interval: Duration,
 }
 
-impl<U> Router<String> for EdgyClient<U>
-where
-    U: AsRef<str>,
-{
-    async fn add_route<F, P, Args, Ret>(&self, path: P, handler: F) -> IoResult<()>
+impl WsRouter<ResponseConn> for EdgyClient {
+    type Binding = WsBinding<RequestConn, ResponseConn>;
+
+    async fn add_route<F, P, Args, Ret>(&self, path: P, handler: F) -> IoResult<Self::Binding>
     where
-        F: AsyncFun<Args, Ret, String>,
-        Args: for<'a> Deserialize<'a> + Serialize,
-        Ret: for<'a> Deserialize<'a> + Serialize,
+        F: WsAsyncFn<Args, Ret, ResponseConn>,
+        Args: for<'a> Deserialize<'a> + Serialize + 'static,
+        Ret: for<'a> Deserialize<'a> + Serialize + 'static,
         P: AsRef<str>,
     {
-        let url = if self.base_url.as_ref().ends_with("/") {
-            format!(
-                "{}{}",
-                self.base_url.as_ref().trim_end_matches('/'),
-                path.as_ref()
-            )
-        } else {
-            format!("{}{}", self.base_url.as_ref(), path.as_ref())
-        };
-        info!("Connect to {}", url);
-        let (stream, _response) = connect_async(
-            url.into_client_request()
-                .map_err(|e| IoError::new(ErrorKind::HostUnreachable, e))?,
-        )
-        .await
-        .map_err(IoError::other)?;
+        let uri = build_uri(&self.base_url, &path, None)?;
+        info!("Connect to {}", uri);
+
+        let (request_tx, request_rx) = oneshot_channel();
+        let (open_tx, open_rx) = oneshot_channel();
+        let (close_tx, close_rx) = oneshot_channel();
         {
-            let mut lock = BIND_SENDERS.lock().await;
+            let mut lock = WS_BINDING_SENDERS.lock().await;
             if lock.contains_key(path.as_ref()) {
                 return Err(IoError::other(format!(
                     "Can't bind to route, `{}` path already exists.",
                     path.as_ref()
                 )));
             }
-            lock.insert(path.as_ref().into(), self.command.clone());
+            lock.insert(path.as_ref().into(), self.command.downgrade());
         }
         let path = path.as_ref().to_owned();
         let path2 = path.clone();
 
-        let (mut write, mut read) = stream.split();
-        let (tx, mut rx) = mpsc_channel(2);
+        let (call_tx, call_rx) = mpsc_channel(2);
+        let max_retries = self.max_retries;
+        let retry_interval = self.retry_interval;
         let task = self.rt.spawn(async move {
-            let mut pending_requests = HashMap::<_, OneshotSender<_>>::new();
-
-            loop {
-                match select(read.next(), Box::pin(rx.recv())).await {
-                    Either::Left((Some(Ok(Message::Close(c))), _)) => {
-                        dbg!(c);
-                        break;
-                    }
-                    Either::Left((None, _)) | Either::Right((None, _)) => break,
-
-                    Either::Left((Some(Ok(msg)), _)) => {
-                        match Packet::<Args, Ret>::from_message(&msg) {
-                            Ok(Packet::Call(id, args)) => {
-                                let ret = match Packet::<Args, Ret>::make_ret_message(
-                                    id,
-                                    handler.call(path.clone().into(), args).await,
-                                ) {
-                                    Ok(r) => r,
-                                    Err(e) => {
-                                        error!(?e, "Unable to encode message.");
-                                        continue;
-                                    }
-                                };
-                                if let Err(e) = write.send(ret).await {
-                                    error!(?e, "Can't send the message.");
-                                }
-                            }
-
-                            Ok(Packet::Ret(id, _ret)) => {
-                                if let Some(tx) = pending_requests.remove(&id) {
-                                    if let Err(e) = tx.send(msg) {
-                                        error!(?e, "Can't send the return message.");
-                                    }
-                                }
-                            }
-                            Err(e) => error!(?e, "Unable to decode packet."),
-                        }
-                    }
-
-                    Either::Right((Some((id, msg, opt_return)), _)) => {
-                        if let Err(e) = write.send(msg).await {
-                            error!(?e, "Can't send the message.");
-                        }
-                        pending_requests.insert(id, opt_return);
-                    }
-
-                    Either::Left((Some(Err(e)), _)) => {
-                        error!(?e, "Can't receive the message.")
-                    }
-                };
-            }
+            ws_dispatch_with_auto_reconnection(
+                uri,
+                request_tx,
+                call_rx,
+                handler,
+                open_tx,
+                close_tx,
+                max_retries,
+                retry_interval,
+            )
+            .await
         });
 
         let (ret_tx, ret_rx) = oneshot_channel();
         self.command
-            .send(Command::AddRoute {
+            .send(Command::AddWsRoute {
                 path: path2,
-                stream: tx,
+                stream: call_tx,
                 task,
                 opt_return: ret_tx,
             })
@@ -169,54 +195,112 @@ where
             .map_err(IoError::other)?;
         ret_rx.await.map_err(IoError::other)??;
 
-        Ok(())
+        WsBinding::new(
+            path,
+            self.command.downgrade(),
+            Arc::downgrade(&self.rt),
+            request_rx,
+            open_rx,
+            close_rx,
+        )
     }
 
-    async fn remove_route<P>(&self, path: P) -> IoResult<()>
-    where
-        P: AsRef<str>,
-    {
-        BIND_SENDERS.lock().await.remove(path.as_ref());
+    async fn remove_route(binding: Self::Binding) -> IoResult<()> {
+        let path = binding.get_path();
+        WS_BINDING_SENDERS.lock().await.remove(path);
         let (ret_tx, ret_rx) = oneshot_channel();
-        self.command
-            .send(Command::RemoveRoute {
-                path: path.as_ref().into(),
+        binding
+            .send_command(Command::RemoveWsRoute {
+                path: path.into(),
                 opt_return: ret_tx,
             })
-            .await
-            .map_err(IoError::other)?;
+            .await?;
         ret_rx.await.map_err(IoError::other)??;
 
         Ok(())
     }
 }
 
-impl<U> EdgyClient<U>
-where
-    U: 'static,
-{
-    pub fn new(base_url: U, num_workers: usize) -> IoResult<Self> {
-        let rt = Builder::new_multi_thread()
-            .worker_threads(num_workers)
-            .enable_all()
-            .build()?;
-        let (tx, rx) = mpsc_channel(2);
-        let task = rt.spawn(Self::worker(rx));
+impl HttpClientRouter<RequestConn> for EdgyClient {
+    type Binding = HttpBinding;
 
-        Ok(Self {
-            base_url,
-            rt,
-            command: tx,
-            task: Some(task),
+    async fn add_route<F, P>(&self, path: P, _handler: F) -> IoResult<Self::Binding>
+    where
+        F: HttpClientAsyncFn<RequestConn>,
+        P: AsRef<str>,
+    {
+        let (request_tx, request_rx) = mpsc_channel(16);
+        let task = self.rt.spawn(http_dispatch(request_rx));
+
+        {
+            let mut lock = HTTP_BINDING_SENDERS.lock().await;
+            if lock.contains_key(path.as_ref()) {
+                task.abort();
+                return Err(IoError::other(format!(
+                    "Can't bind to route, `{}` path already exists.",
+                    path.as_ref()
+                )));
+            }
+            lock.insert(
+                path.as_ref().into(),
+                request::HttpBindingConfig {
+                    sender: request_tx,
+                    base_url: self.base_url.clone(),
+                    max_retries: self.max_retries,
+                    retry_interval: self.retry_interval,
+                },
+            );
+        }
+
+        Ok(HttpBinding::new(path, self.command.downgrade(), task))
+    }
+
+    async fn remove_route(binding: Self::Binding) -> IoResult<()> {
+        let path = binding.get_path();
+        HTTP_BINDING_SENDERS.lock().await.remove(path).ok_or({
+            IoError::other(format!(
+                "Can't remove route, `{}` path doesn't exists.",
+                path
+            ))
+        })?;
+
+        Ok(())
+    }
+}
+
+impl EdgyClient {
+    /// Creates a new `EdgyClient` with default settings.
+    pub fn new<U>(base_url: U) -> IoResult<Self>
+    where
+        U: AsRef<str>,
+    {
+        Self::builder(base_url)?.build()
+    }
+
+    /// Creates a builder for configuring the client.
+    pub fn builder<U>(base_url: U) -> IoResult<EdgyClientBuilder>
+    where
+        U: AsRef<str>,
+    {
+        Ok(EdgyClientBuilder {
+            base_url: base_url.as_ref().parse().map_err(IoError::other)?,
+            num_workers: DEFAULT_NUM_WORKERS,
+            max_retries: DEFAULT_MAX_RETRIES,
+            retry_interval: Duration::from_millis(DEFAULT_RETRY_INTERVAL_MS),
         })
     }
 
-    pub async fn run(mut self) -> IoResult<Self> {
+    /// Runs the client until all tasks complete or an error occurs.
+    ///
+    /// This method blocks until the internal worker task finishes.
+    /// The client will continue processing requests and handling
+    /// WebSocket connections until explicitly aborted.
+    pub async fn run(mut self) -> IoResult<()> {
         if let Some(task) = self.task.take() {
             task.await.map_err(IoError::other)??;
         }
 
-        Ok(self)
+        Ok(())
     }
 
     async fn worker(mut command: MpscReceiver<Command>) -> IoResult<()> {
@@ -224,7 +308,7 @@ where
 
         while let Some(item) = command.recv().await {
             match item {
-                Command::AddRoute {
+                Command::AddWsRoute {
                     path,
                     stream,
                     task,
@@ -240,7 +324,7 @@ where
                         .map_or_else(|e| e.map_err(IoError::other), Ok)?;
                 }
 
-                Command::RemoveRoute { path, opt_return } => opt_return
+                Command::RemoveWsRoute { path, opt_return } => opt_return
                     .send(tasks.remove(&path).map_or(
                         Err(IoError::other(format!("Can't remove route: {}", path))),
                         |(_, i)| Ok(i.abort()),
@@ -267,62 +351,13 @@ where
         Ok(())
     }
 
+    /// Aborts the client and all background tasks immediately.
+    ///
+    /// This will terminate all active connections and stop processing
+    /// any pending requests. Use this for graceful shutdown.
     pub fn abort(self) {
         if let Some(task) = self.task {
             task.abort();
-        }
-    }
-}
-
-pub trait ServiceCaller<Args, Ret, Acc> {
-    fn call_remotely<F>(self, f: F) -> impl Future<Output = IoResult<Ret>>
-    where
-        F: AsyncFun<Args, Ret, Acc>;
-}
-
-impl<Args, Ret, Acc> ServiceCaller<Args, Ret, Acc> for Args
-where
-    Args: for<'a> Deserialize<'a> + Serialize,
-    Ret: for<'a> Deserialize<'a> + Serialize,
-{
-    async fn call_remotely<F>(self, _f: F) -> IoResult<Ret>
-    where
-        F: AsyncFun<Args, Ret, Acc>,
-    {
-        static AUTO_ID: AtomicReqId = AtomicReqId::new(0);
-
-        let path = F::get_path();
-        let Some(command) = BIND_SENDERS.lock().await.get(&path).map(|i| i.clone()) else {
-            return Err(IoError::other(format!(
-                "The `{}` path used by the current `{}` function has not been bound to the client.",
-                path,
-                type_name::<F>()
-            )));
-        };
-
-        let req_id = AUTO_ID
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| {
-                Some(v.wrapping_add(1))
-            })
-            .unwrap_or_default();
-        let (tx, rx) = oneshot_channel();
-        command
-            .send(Command::CallRemotely {
-                path,
-                id: req_id,
-                msg: Packet::<Args, Ret>::make_call_message(req_id, self)?,
-                opt_return: tx,
-            })
-            .await
-            .map_err(IoError::other)?;
-
-        match Packet::<Args, Ret>::from_message(&rx.await.map_err(IoError::other)??)? {
-            Packet::Ret(id, _) if id != req_id => Err(IoError::other(format!(
-                "The received message ID does not match the request ID: {} != {}",
-                id, req_id
-            ))),
-            Packet::Ret(_id, ret) => Ok(ret),
-            _ => Err(IoError::other("Unable to decode packet.")),
         }
     }
 }

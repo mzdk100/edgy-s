@@ -2,80 +2,307 @@
 
 [English](./README.md)
 
-一个极简的 WebSocket 双向 RPC 框架，用优雅的函数式路由构建复杂的微服务应用。
+一个极简的 WebSocket/HTTP 双向 RPC 框架，用优雅的函数式路由构建复杂的微服务应用。
 
 ## 特性
 
 - **极简 API** - 一行代码将函数绑定为路由
 - **双向 RPC** - 客户端和服务端都可以主动发起远程调用
-- **类型安全** - 基于 serde 的完整类型安全序列化
+- **HTTP 支持** - 完整的 HTTP 请求/响应处理，支持流式传输
+- **类型安全** - 严格的类型约束和基于 serde 的完整序列化
 - **自动路径推导** - 从函数名自动生成路由路径
 - **零样板代码** - 无宏、无复杂配置
 - **特性开关** - 按需引入客户端/服务端功能
+- **自动重连** - WebSocket 客户端支持可配置的重试逻辑
+- **Builder 模式** - 灵活的客户端/服务端配置
 
-## 快速开始
-
-### 添加依赖
+## 安装
 
 ```toml
 [dependencies]
-edgy-s = { version = "0.1", features = ["server", "client"] }
+edgy-s = { version = "1.0", features = ["server", "client"] }
 ```
+
+## 快速开始
 
 ### 服务端示例
 
 ```rust
-use edgy_s::{AsyncFun, ClientCaller, EdgyService, ServiceAccessor};
+use edgy_s::{
+    Binding, HttpServerAsyncFn, WsAsyncFn,
+    server::{EdgyService, HttpAccessor, WsAccessor, WsCaller},
+};
+use async_stream::stream;
+use futures_util::{Stream, StreamExt};
+use std::{io::Result as IoResult, pin::Pin};
+use tokio::time::{Duration, sleep};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let service = EdgyService::new("0.0.0.0:8080", 4).await?;
+    // 使用 Builder 模式创建服务
+    let service = EdgyService::builder("0.0.0.0:8080")
+        .workers(4)
+        .build()
+        .await?;
     
-    // 绑定函数作为路由 - 就这么简单！
-    api_add.bind(&service).await?;
+    // 绑定 WebSocket 路由，支持生命周期钩子
+    let bd_api_add = api_add
+        .bind(&service)
+        .await?
+        .on_open(on_open)
+        .await
+        .on_close(on_close)
+        .await;
+    
+    // 绑定 HTTP 路由
+    let bd_index = index.bind_as_response(&service).await?;
+    let bd_stream = countdown.bind_as_response(&service).await?;
     
     service.run().await?;
+    
+    // 清理
+    bd_api_add.unbind().await?;
+    bd_index.unbind().await?;
+    bd_stream.unbind().await?;
+    
     Ok(())
 }
 
-// 定义你的 API 函数
-async fn api_add(accessor: ServiceAccessor, a: i32, b: i32) -> i32 {
+// WebSocket 处理器 - 双向 RPC
+async fn api_add(accessor: WsAccessor, a: i32, b: i32) -> i32 {
     // 服务端也可以调用客户端的方法！
     tokio::spawn(async move {
         let result: i32 = (5, 5).call_remotely(&accessor).await.unwrap();
         println!("客户端计算: 5 + 5 = {}", result);
     });
-    
     a + b
+}
+
+async fn on_open(accessor: HttpAccessor) {
+    println!("WebSocket 连接来自: {}", accessor.get_addr());
+}
+
+async fn on_close(accessor: WsAccessor) {
+    println!("WebSocket 断开来自: {}", accessor.get_addr());
+}
+
+// HTTP 处理器 - 简单响应
+async fn index(accessor: HttpAccessor, body: String) -> String {
+    let name = accessor.get_argument("name").unwrap_or_default();
+    accessor.set_header("Content-Type", "text/html").unwrap();
+    format!("<html><body>Hello {}, {}!</body></html>", name, body)
+}
+
+// HTTP 处理器 - 流式响应
+async fn countdown(accessor: HttpAccessor, _body: String) -> Pin<Box<impl Stream<Item = String>>> {
+    let from = accessor.get_argument("from")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10u8);
+    
+    Box::pin(stream! {
+        yield format!("<p>从 {} 倒计时</p>", from);
+        for i in (0..from).rev() {
+            sleep(Duration::from_secs(1)).await;
+            yield format!("<p>{}</p>", i);
+        }
+    })
 }
 ```
 
 ### 客户端示例
 
 ```rust
-use edgy_s::{AsyncFun, ClientAccessor, EdgyClient, ServiceCaller};
+use edgy_s::{
+    Binding, HttpClientAsyncFn, WsAsyncFn,
+    client::{EdgyClient, HttpPost, RequestAccessor, WsAccessor, WsCaller},
+};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let client = EdgyClient::new("ws://localhost:8080", 2)?;
+    // 使用 Builder 模式创建客户端
+    let client = EdgyClient::builder("ws://localhost:8080")?
+        .workers(2)
+        .max_retries(5)
+        .retry_interval_ms(1000)
+        .build()?;
     
-    // 绑定以接收服务端调用
-    api_add.bind(&client).await?;
+    // 绑定 WebSocket 路由
+    let bd_api_add = api_add
+        .bind(&client)
+        .await?
+        .on_open(on_open)
+        .await
+        .on_close(on_close)
+        .await;
     
-    // 调用服务端方法
+    // 绑定 HTTP 路由
+    let bd_index = index.bind_as_request(&client).await?;
+    
+    // 发送 HTTP POST 请求
     tokio::spawn(async {
-        let result = (1, 2).call_remotely(api_add).await.unwrap();
+        let (response, accessor): (String, _) = "请求体"
+            .post(index)
+            .await
+            .unwrap();
+        println!("状态码: {}, 响应: {}", accessor.status(), response);
+    });
+    
+    // 通过 WebSocket RPC 调用服务端
+    tokio::spawn(async {
+        let result: i32 = (1, 2).call_remotely(api_add).await.unwrap();
         println!("服务端计算: 1 + 2 = {}", result);
     });
     
     client.run().await?;
+    
+    bd_api_add.unbind().await?;
+    bd_index.unbind().await?;
+    
     Ok(())
 }
 
-// 客户端也可以处理服务端的调用
-async fn api_add(accessor: ClientAccessor, a: i32, b: i32) -> i32 {
+// WebSocket 处理器 - 接收服务端调用
+async fn api_add(accessor: WsAccessor, a: i32, b: i32) -> i32 {
+    println!("服务端请求: {} + {}", a, b);
     a + b
 }
+
+// HTTP 请求配置器
+async fn index(accessor: RequestAccessor) {
+    accessor.set_header("User-Agent", "edgy-s-client").unwrap();
+    accessor.set_argument("name", "world");
+}
+
+async fn on_open(accessor: WsAccessor) {
+    println!("已连接到: {}", accessor.path());
+}
+
+async fn on_close(accessor: WsAccessor) {
+    println!("已断开: {}", accessor.path());
+}
+```
+
+## API 参考
+
+### 客户端配置
+
+```rust
+let client = EdgyClient::builder("ws://localhost:8080")?
+    .workers(4)              // 异步工作线程数
+    .max_retries(5)          // WebSocket 最大重连次数
+    .retry_interval_ms(1000) // 重试间隔毫秒
+    .retry_interval(Duration::from_secs(1)) // 或使用 Duration
+    .build()?;
+```
+
+### 服务端配置
+
+```rust
+let service = EdgyService::builder("0.0.0.0:8080")
+    .workers(4)
+    .build()
+    .await?;
+```
+
+### HTTP 方法
+
+```rust
+// GET 请求
+let (body, accessor): (String, _) = ().get(handler).await?;
+
+// POST 请求
+let (body, accessor): (String, _) = "body".post(handler).await?;
+
+// PUT 请求
+let (body, accessor): (String, _) = "body".put(handler).await?;
+
+// PATCH 请求
+let (body, accessor): (String, _) = "body".patch(handler).await?;
+
+// DELETE 请求
+let (body, accessor): (String, _) = ().delete(handler).await?;
+
+// HEAD 请求
+let accessor: HttpAccessor = ().head(handler).await?;
+```
+
+### Accessor 方法
+
+#### 服务端 (WsAccessor / HttpAccessor)
+
+| 方法 | 描述 |
+|------|------|
+| `get_addr()` | 获取客户端 socket 地址 |
+| `get_argument(name)` | 获取 URL 查询参数（已解码） |
+| `get_arguments(name)` | 获取参数的所有值 |
+| `get_all_arguments()` | 获取所有查询参数为 HashMap |
+| `get_header(name)` | 获取请求头 |
+| `get_headers()` | 获取所有请求头 |
+| `set_header(name, value)` | 设置响应头 |
+| `add_header(name, value)` | 追加响应头 |
+| `get_other_conns()` | 获取同路径的其他连接（仅 WsAccessor） |
+
+#### 客户端 (WsAccessor / RequestAccessor)
+
+| 方法 | 描述 |
+|------|------|
+| `path()` | 获取请求路径 |
+| `status()` | 获取 HTTP 状态码（连接后的 WsAccessor） |
+| `get_header(name)` | 获取响应头 |
+| `get_headers()` | 获取所有响应头 |
+| `set_header(name, value)` | 设置请求头（RequestAccessor） |
+| `add_header(name, value)` | 追加请求头（RequestAccessor） |
+| `set_argument(name, value)` | 设置 URL 查询参数（RequestAccessor） |
+
+## 1.0 版本破坏性变更
+
+### API 重命名
+
+| 0.x | 1.0 |
+|-----|-----|
+| `AsyncFun` | `WsAsyncFn` |
+| `ServiceAccessor` | `WsAccessor`（服务端） |
+| `ClientAccessor` | `WsAccessor`（客户端） |
+| `ClientCaller` / `ServiceCaller` | `WsCaller` |
+
+### 构造函数变更
+
+```rust
+// 0.x
+let client = EdgyClient::new("ws://localhost", 4)?;
+let service = EdgyService::new("0.0.0.0:80", 4).await?;
+
+// 1.0
+let client = EdgyClient::builder("ws://localhost")?
+    .workers(4)
+    .max_retries(5)
+    .build()?;
+let service = EdgyService::builder("0.0.0.0:80")
+    .workers(4)
+    .build()
+    .await?;
+```
+
+### 新增 HTTP 支持
+
+1.0 版本为客户端和服务端添加了完整的 HTTP 支持：
+
+- 服务端：`bind_as_response()`、`bind_by_path_as_response()`
+- 客户端：`bind_as_request()`、`bind_by_path_as_request()`
+- HTTP 方法：`get()`、`post()`、`put()`、`patch()`、`delete()`、`head()`
+- 流式请求/响应体
+
+### 生命周期钩子
+
+```rust
+// 0.x - 无生命周期钩子
+
+// 1.0 - 链式调用生命周期处理器
+binding
+    .on_open(handler)
+    .await
+    .on_close(handler)
+    .await
 ```
 
 ## 请求 ID 配置
@@ -84,51 +311,26 @@ async fn api_add(accessor: ClientAccessor, a: i32, b: i32) -> i32 {
 
 | Feature | 类型 | 最大并发请求数 |
 |---------|------|---------------|
-| `req_id_u8` (默认) | u8 | 256 |
+| `req_id_u8`（默认） | u8 | 256 |
 | `req_id_u16` | u16 | 65,536 |
 | `req_id_u32` | u32 | 约 42 亿 |
 | `req_id_u64` | u64 | 几乎无限 |
 
 ```toml
 [dependencies]
-edgy-s = { version = "0.1", features = ["server", "client", "req_id_u32"] }
+edgy-s = { version = "1.0", features = ["server", "client", "req_id_u32"] }
 ```
 
 ## 特性开关
 
 | Flag | 描述 |
 |------|------|
-| `client` | 启用 WebSocket 客户端功能 |
-| `server` | 启用 WebSocket 服务端功能 |
+| `client` | 启用客户端功能（WebSocket + HTTP） |
+| `server` | 启用服务端功能（WebSocket + HTTP） |
 | `req_id_u8` | 使用 u8 作为请求 ID（默认） |
 | `req_id_u16` | 使用 u16 作为请求 ID |
 | `req_id_u32` | 使用 u32 作为请求 ID |
 | `req_id_u64` | 使用 u64 作为请求 ID |
-
-## API 设计理念
-
-### 函数即路由
-
-路由路径自动从函数名推导：
-
-```rust
-async fn my_api_handler(...) { ... }
-// 路由: /my/api/handler
-```
-
-### 绑定即注册
-
-```rust
-my_handler.bind(&service).await?;  // 注册并连接
-my_handler.unbind(&service).await?; // 注销并断开
-```
-
-### 参数即调用
-
-```rust
-// 用参数调用远程函数
-(参数).call_remotely(handler).await
-```
 
 ## 许可证
 

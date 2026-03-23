@@ -2,80 +2,307 @@
 
 [中文文档](./README_ZH.md)
 
-A minimalist WebSocket bidirectional RPC framework for building complex microservice applications with elegant, function-based routing.
+A minimalist WebSocket/HTTP bidirectional RPC framework for building complex microservice applications with elegant, function-based routing.
 
 ## Features
 
 - **Minimalist API** - Bind functions as routes with a single call
 - **Bidirectional RPC** - Both client and server can initiate remote calls
-- **Type Safe** - Full type safety with serde serialization
+- **HTTP Support** - Full HTTP request/response handling with streaming support
+- **Type Safe** - Strict type constraints and full serde-based serialization
 - **Automatic Path Derivation** - Routes are auto-generated from function names
 - **Zero Boilerplate** - No macros, no complex configuration
 - **Feature Flags** - Include only what you need (client/server)
+- **Auto Reconnection** - WebSocket client with configurable retry logic
+- **Builder Pattern** - Flexible client/service configuration
 
-## Quick Start
-
-### Add Dependency
+## Installation
 
 ```toml
 [dependencies]
-edgy-s = { version = "0.1", features = ["server", "client"] }
+edgy-s = { version = "1.0", features = ["server", "client"] }
 ```
+
+## Quick Start
 
 ### Server Example
 
 ```rust
-use edgy_s::{AsyncFun, ClientCaller, EdgyService, ServiceAccessor};
+use edgy_s::{
+    Binding, HttpServerAsyncFn, WsAsyncFn,
+    server::{EdgyService, HttpAccessor, WsAccessor, WsCaller},
+};
+use async_stream::stream;
+use futures_util::{Stream, StreamExt};
+use std::{io::Result as IoResult, pin::Pin};
+use tokio::time::{Duration, sleep};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let service = EdgyService::new("0.0.0.0:8080", 4).await?;
+    // Create server with builder pattern
+    let service = EdgyService::builder("0.0.0.0:8080")
+        .workers(4)
+        .build()
+        .await?;
     
-    // Bind function as a route - that's it!
-    api_add.bind(&service).await?;
+    // Bind WebSocket route with lifecycle hooks
+    let bd_api_add = api_add
+        .bind(&service)
+        .await?
+        .on_open(on_open)
+        .await
+        .on_close(on_close)
+        .await;
+    
+    // Bind HTTP routes
+    let bd_index = index.bind_as_response(&service).await?;
+    let bd_stream = countdown.bind_as_response(&service).await?;
     
     service.run().await?;
+    
+    // Cleanup
+    bd_api_add.unbind().await?;
+    bd_index.unbind().await?;
+    bd_stream.unbind().await?;
+    
     Ok(())
 }
 
-// Define your API function
-async fn api_add(accessor: ServiceAccessor, a: i32, b: i32) -> i32 {
-    // Server can also call client methods!
+// WebSocket handler - bidirectional RPC
+async fn api_add(accessor: WsAccessor, a: i32, b: i32) -> i32 {
+    // Server can call client methods!
     tokio::spawn(async move {
         let result: i32 = (5, 5).call_remotely(&accessor).await.unwrap();
         println!("Client computed: 5 + 5 = {}", result);
     });
-    
     a + b
+}
+
+async fn on_open(accessor: HttpAccessor) {
+    println!("WebSocket opened from: {}", accessor.get_addr());
+}
+
+async fn on_close(accessor: WsAccessor) {
+    println!("WebSocket closed from: {}", accessor.get_addr());
+}
+
+// HTTP handler - simple response
+async fn index(accessor: HttpAccessor, body: String) -> String {
+    let name = accessor.get_argument("name").unwrap_or_default();
+    accessor.set_header("Content-Type", "text/html").unwrap();
+    format!("<html><body>Hello {}, {}!</body></html>", name, body)
+}
+
+// HTTP handler - streaming response
+async fn countdown(accessor: HttpAccessor, _body: String) -> Pin<Box<impl Stream<Item = String>>> {
+    let from = accessor.get_argument("from")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10u8);
+    
+    Box::pin(stream! {
+        yield format!("<p>Countdown from {}</p>", from);
+        for i in (0..from).rev() {
+            sleep(Duration::from_secs(1)).await;
+            yield format!("<p>{}</p>", i);
+        }
+    })
 }
 ```
 
 ### Client Example
 
 ```rust
-use edgy_s::{AsyncFun, ClientAccessor, EdgyClient, ServiceCaller};
+use edgy_s::{
+    Binding, HttpClientAsyncFn, WsAsyncFn,
+    client::{EdgyClient, HttpPost, RequestAccessor, WsAccessor, WsCaller},
+};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let client = EdgyClient::new("ws://localhost:8080", 2)?;
+    // Create client with builder pattern
+    let client = EdgyClient::builder("ws://localhost:8080")?
+        .workers(2)
+        .max_retries(5)
+        .retry_interval_ms(1000)
+        .build()?;
     
-    // Bind to receive server calls
-    api_add.bind(&client).await?;
+    // Bind WebSocket route
+    let bd_api_add = api_add
+        .bind(&client)
+        .await?
+        .on_open(on_open)
+        .await
+        .on_close(on_close)
+        .await;
     
-    // Call server method
+    // Bind HTTP route
+    let bd_index = index.bind_as_request(&client).await?;
+    
+    // Make HTTP POST request
     tokio::spawn(async {
-        let result = (1, 2).call_remotely(api_add).await.unwrap();
+        let (response, accessor): (String, _) = "request body"
+            .post(index)
+            .await
+            .unwrap();
+        println!("Status: {}, Response: {}", accessor.status(), response);
+    });
+    
+    // Call server via WebSocket RPC
+    tokio::spawn(async {
+        let result: i32 = (1, 2).call_remotely(api_add).await.unwrap();
         println!("Server computed: 1 + 2 = {}", result);
     });
     
     client.run().await?;
+    
+    bd_api_add.unbind().await?;
+    bd_index.unbind().await?;
+    
     Ok(())
 }
 
-// Client can also handle server calls
-async fn api_add(accessor: ClientAccessor, a: i32, b: i32) -> i32 {
+// WebSocket handler - receives calls from server
+async fn api_add(accessor: WsAccessor, a: i32, b: i32) -> i32 {
+    println!("Server requested: {} + {}", a, b);
     a + b
 }
+
+// HTTP request configurator
+async fn index(accessor: RequestAccessor) {
+    accessor.set_header("User-Agent", "edgy-s-client").unwrap();
+    accessor.set_argument("name", "world");
+}
+
+async fn on_open(accessor: WsAccessor) {
+    println!("Connected to: {}", accessor.path());
+}
+
+async fn on_close(accessor: WsAccessor) {
+    println!("Disconnected from: {}", accessor.path());
+}
+```
+
+## API Reference
+
+### Client Configuration
+
+```rust
+let client = EdgyClient::builder("ws://localhost:8080")?
+    .workers(4)              // Number of async worker threads
+    .max_retries(5)          // Max WebSocket reconnection attempts
+    .retry_interval_ms(1000) // Milliseconds between retries
+    .retry_interval(Duration::from_secs(1)) // Or use Duration
+    .build()?;
+```
+
+### Server Configuration
+
+```rust
+let service = EdgyService::builder("0.0.0.0:8080")
+    .workers(4)
+    .build()
+    .await?;
+```
+
+### HTTP Methods
+
+```rust
+// GET request
+let (body, accessor): (String, _) = ().get(handler).await?;
+
+// POST request
+let (body, accessor): (String, _) = "body".post(handler).await?;
+
+// PUT request
+let (body, accessor): (String, _) = "body".put(handler).await?;
+
+// PATCH request
+let (body, accessor): (String, _) = "body".patch(handler).await?;
+
+// DELETE request
+let (body, accessor): (String, _) = ().delete(handler).await?;
+
+// HEAD request
+let accessor: HttpAccessor = ().head(handler).await?;
+```
+
+### Accessor Methods
+
+#### Server-side (WsAccessor / HttpAccessor)
+
+| Method | Description |
+|--------|-------------|
+| `get_addr()` | Get client socket address |
+| `get_argument(name)` | Get URL query parameter (decoded) |
+| `get_arguments(name)` | Get all values for a parameter |
+| `get_all_arguments()` | Get all query parameters as HashMap |
+| `get_header(name)` | Get request header |
+| `get_headers()` | Get all request headers |
+| `set_header(name, value)` | Set response header |
+| `add_header(name, value)` | Append response header |
+| `get_other_conns()` | Get other connections to same path (WsAccessor only) |
+
+#### Client-side (WsAccessor / RequestAccessor)
+
+| Method | Description |
+|--------|-------------|
+| `path()` | Get the request path |
+| `status()` | Get HTTP status code (WsAccessor after connection) |
+| `get_header(name)` | Get response header |
+| `get_headers()` | Get all response headers |
+| `set_header(name, value)` | Set request header (RequestAccessor) |
+| `add_header(name, value)` | Append request header (RequestAccessor) |
+| `set_argument(name, value)` | Set URL query parameter (RequestAccessor) |
+
+## Breaking Changes in 1.0
+
+### API Renames
+
+| 0.x | 1.0 |
+|-----|-----|
+| `AsyncFun` | `WsAsyncFn` |
+| `ServiceAccessor` | `WsAccessor` (server) |
+| `ClientAccessor` | `WsAccessor` (client) |
+| `ClientCaller` / `ServiceCaller` | `WsCaller` |
+
+### Constructor Changes
+
+```rust
+// 0.x
+let client = EdgyClient::new("ws://localhost", 4)?;
+let service = EdgyService::new("0.0.0.0:80", 4).await?;
+
+// 1.0
+let client = EdgyClient::builder("ws://localhost")?
+    .workers(4)
+    .max_retries(5)
+    .build()?;
+let service = EdgyService::builder("0.0.0.0:80")
+    .workers(4)
+    .build()
+    .await?;
+```
+
+### New HTTP Support
+
+1.0 adds comprehensive HTTP support for both client and server:
+
+- Server: `bind_as_response()`, `bind_by_path_as_response()`
+- Client: `bind_as_request()`, `bind_by_path_as_request()`
+- HTTP methods: `get()`, `post()`, `put()`, `patch()`, `delete()`, `head()`
+- Streaming request/response bodies
+
+### Lifecycle Hooks
+
+```rust
+// 0.x - no lifecycle hooks
+
+// 1.0 - chain lifecycle handlers
+binding
+    .on_open(handler)
+    .await
+    .on_close(handler)
+    .await
 ```
 
 ## Request ID Configuration
@@ -91,44 +318,19 @@ Choose the appropriate request ID width based on your concurrency needs:
 
 ```toml
 [dependencies]
-edgy-s = { version = "0.1", features = ["server", "client", "req_id_u32"] }
+edgy-s = { version = "1.0", features = ["server", "client", "req_id_u32"] }
 ```
 
 ## Feature Flags
 
 | Flag | Description |
 |------|-------------|
-| `client` | Enable WebSocket client functionality |
-| `server` | Enable WebSocket server functionality |
+| `client` | Enable client functionality (WebSocket + HTTP) |
+| `server` | Enable server functionality (WebSocket + HTTP) |
 | `req_id_u8` | Use u8 for request IDs (default) |
 | `req_id_u16` | Use u16 for request IDs |
 | `req_id_u32` | Use u32 for request IDs |
 | `req_id_u64` | Use u64 for request IDs |
-
-## API Design Philosophy
-
-### Function as Route
-
-Routes are automatically derived from function names:
-
-```rust
-async fn my_api_handler(...) { ... }
-// Route: /my/api/handler
-```
-
-### Bind is Register
-
-```rust
-my_handler.bind(&service).await?;  // Registers and connects
-my_handler.unbind(&service).await?; // Unregisters and disconnects
-```
-
-### Arguments as Call
-
-```rust
-// Call remote with arguments
-(args).call_remotely(handler).await
-```
 
 ## License
 

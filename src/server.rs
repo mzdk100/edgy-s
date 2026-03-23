@@ -1,345 +1,114 @@
+mod binding;
+mod caller;
+mod command;
+mod conn;
+mod handler;
+
 use {
-    super::types::{Accessor, AsyncFun, AtomicReqId, Packet, ReqId, Router},
-    futures_util::{
-        SinkExt, StreamExt,
-        future::{Either, select},
+    super::types::{
+        Accessor, HttpServerAsyncFn, HttpServerRouter, IntoStreamingBody, Packet, StreamingBody,
+        WsAsyncFn, WsRouter,
     },
-    hyper::{
-        Request, Response, StatusCode, Version,
-        body::Incoming,
-        header::{
-            CONNECTION, HeaderMap, HeaderValue, SEC_WEBSOCKET_ACCEPT, SEC_WEBSOCKET_KEY,
-            SEC_WEBSOCKET_VERSION, UPGRADE,
-        },
-        server::conn::http1::Builder as Http1Builder,
-        service::Service as HyperService,
-        upgrade::on,
-    },
+    binding::{HttpBinding, WsBinding},
+    caller::BIND_SENDERS,
+    command::Command,
+    conn::{HttpConn, WS_CONNS, WsConn},
+    handler::WebHandler,
+    hyper::{header::HeaderMap, http::Uri, server::conn::http1::Builder as Http1Builder},
     hyper_util::rt::TokioIo,
     serde::{Deserialize, Serialize},
     std::{
         collections::HashMap,
+        future::Future,
         io::{Error as IoError, ErrorKind, Result as IoResult},
-        mem::take,
-        net::{IpAddr, SocketAddr},
-        pin::Pin,
-        str::FromStr,
-        sync::{Arc, LazyLock, Weak, atomic::Ordering},
+        net::SocketAddr,
+        sync::Arc,
     },
     tokio::{
         net::{TcpListener, ToSocketAddrs, lookup_host},
         runtime::{Builder, Runtime},
         sync::{
-            Mutex,
             mpsc::{Receiver as MpscReceiver, Sender as MpscSender, channel as mpsc_channel},
             oneshot::{Sender as OneshotSender, channel as oneshot_channel},
+            watch::channel as watch_channel,
         },
         task::JoinHandle,
     },
-    tokio_tungstenite::{
-        WebSocketStream,
-        tungstenite::{Message, handshake::derive_accept_key, protocol::Role},
-    },
-    tracing::{error, info, warn},
+    tracing::{error, info},
 };
 
-static BIND_SENDERS: LazyLock<Mutex<HashMap<String, MpscSender<Command>>>> =
-    LazyLock::new(Default::default);
-static CONNS: LazyLock<Mutex<HashMap<(String, SocketAddr), MpscSender<Message>>>> =
-    LazyLock::new(Default::default);
+pub use {
+    caller::WsCaller,
+    conn::{HttpAccessor, WsAccessor},
+};
 
-/// RAII guard to ensure connection cleanup on task abort
-struct ConnGuard {
-    path: String,
-    socket_addr: SocketAddr,
-    rt: Weak<Runtime>,
+/// Default configuration values
+const DEFAULT_NUM_WORKERS: usize = 4;
+
+/// Builder for creating `EdgyService` with custom configuration.
+///
+/// # Example
+/// ```no_run
+/// use edgy_s::EdgyService;
+///
+/// let service = EdgyService::builder("0.0.0.0:80")
+///     .workers(2)
+///     .build()
+///     .await?;
+/// ```
+pub struct EdgyServiceBuilder<Addr> {
+    bind_addr: Addr,
+    num_workers: usize,
 }
 
-impl Drop for ConnGuard {
-    fn drop(&mut self) {
-        let Some(rt) = self.rt.upgrade() else {
-            warn!("Runtime already dropped.");
-            return;
-        };
-
-        let path = take(&mut self.path);
-        let socket_addr = self.socket_addr;
-        // Spawn a new task to handle async cleanup since Drop cannot be async
-        rt.spawn(async move {
-            CONNS.lock().await.remove(&(path, socket_addr));
-        });
+impl<Addr> EdgyServiceBuilder<Addr>
+where
+    Addr: ToSocketAddrs,
+{
+    /// Sets the number of worker threads for the async runtime.
+    pub fn workers(mut self, num: usize) -> Self {
+        self.num_workers = num;
+        self
     }
-}
 
-pub struct WebHandler {
-    socket_addr: SocketAddr,
-    command: MpscSender<Command>,
-    rt: Weak<Runtime>,
-}
+    /// Builds the `EdgyService` with the configured settings.
+    pub async fn build(self) -> IoResult<EdgyService> {
+        let rt = Builder::new_multi_thread()
+            .worker_threads(self.num_workers)
+            .enable_all()
+            .build()?;
 
-impl HyperService<Request<Incoming>> for WebHandler {
-    type Response = Response<String>;
-    type Error = IoError;
-    type Future = Pin<Box<dyn Future<Output = IoResult<Self::Response>> + Send>>;
+        let (command_tx, command_rx) = mpsc_channel(2);
+        let worker_task = rt.spawn(EdgyService::worker(command_rx));
 
-    fn call(&self, mut req: Request<Incoming>) -> Self::Future {
-        let headers = req.headers();
-        let key = headers.get(SEC_WEBSOCKET_KEY);
-        let ver = req.version();
-        if ver < Version::HTTP_11
-            || !headers
-                .get(CONNECTION)
-                .and_then(|h| h.to_str().ok())
-                .map(|h| {
-                    h.split(|c| c == ' ' || c == ',')
-                        .any(|p| p.eq_ignore_ascii_case(Self::UPGRADE_VALUE))
-                })
-                .unwrap_or(false)
-            || !headers
-                .get(UPGRADE)
-                .and_then(|h| h.to_str().ok())
-                .map(|h| h.eq_ignore_ascii_case(Self::WEBSOCKET_VALUE))
-                .unwrap_or(false)
-            || !headers
-                .get(SEC_WEBSOCKET_VERSION)
-                .map(|h| h == "13")
-                .unwrap_or(false)
-            || key.is_none()
-        {
-            // 非WebSocket请求，返回400错误
-            let mut res = Response::new(String::from("Bad Request: WebSocket upgrade required"));
-            *res.status_mut() = StatusCode::BAD_REQUEST;
-            return Box::pin(async move { Ok(res) });
-        }
-
-        let rt = self.rt.clone();
-        let Some(rt2) = rt.upgrade() else {
-            return Box::pin(async move {
-                let mut res = Response::new(String::from("Internal Server Error"));
-                *res.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
-                Ok(res)
-            });
-        };
-
-        let derived = key.map(|k| derive_accept_key(k.as_bytes()));
-        let path = req.uri().path().to_owned();
-        info!("Establish bidi-communication {}", path);
-        let command = self.command.clone();
-        let socket_addr = self.extract_real_ip(headers);
-        rt2.spawn(async move {
-            let stream = match on(&mut req).await {
-                Ok(upgraded) => {
-                    WebSocketStream::from_raw_socket(TokioIo::new(upgraded), Role::Server, None)
-                        .await
-                }
-                Err(e) => return error!(?e, "Upgrade error."),
-            };
-
-            let (mut outgoing, mut incoming) = stream.split();
-            let (tx, mut rx) = mpsc_channel(2);
-            if CONNS
-                .lock()
-                .await
-                .insert((path.clone(), socket_addr), tx)
-                .is_some()
-            {
-                warn!("Overwrite connection to {}", path);
-            }
-
-            // Guard ensures cleanup on task abort
-            let _guard = ConnGuard {
-                path: path.clone(),
-                socket_addr,
-                rt,
-            };
-
-            loop {
-                match select(incoming.next(), Box::pin(rx.recv())).await {
-                    Either::Left((Some(Ok(Message::Close(c))), _)) => {
-                        dbg!(c);
-                        break;
-                    }
-                    Either::Left((None, _)) | Either::Right((None, _)) => break,
-
-                    Either::Left((Some(Ok(msg)), _)) => {
-                        let (ret_tx, ret_rx) = oneshot_channel();
-                        if let Err(e) = command
-                            .send(Command::Transfer {
-                                socket_addr,
-                                path: path.clone(),
-                                msg,
-                                ret_tx,
-                            })
-                            .await
-                        {
-                            error!(?e, "Can't handle the message.")
-                        }
-
-                        match ret_rx.await {
-                            Ok(Some(msg)) => {
-                                if let Err(e) = outgoing.send(msg).await {
-                                    error!(?e, "Can't send the message.");
-                                }
-                            }
-                            Err(e) => error!(?e, "Can't receive the message."),
-                            _ => (),
-                        }
-                    }
-
-                    Either::Right((Some(msg), _)) => {
-                        if let Err(e) = outgoing.send(msg).await {
-                            error!(?e, "Can't send the message.");
-                        }
-                    }
-
-                    Either::Left((Some(Err(e)), _)) => {
-                        error!(?e, "Received error.");
-                        break;
-                    }
-                }
-            }
-        });
-
-        Box::pin(async move {
-            let mut res = Response::new(String::new());
-            *res.status_mut() = StatusCode::SWITCHING_PROTOCOLS;
-            *res.version_mut() = ver;
-            res.headers_mut()
-                .append(CONNECTION, HeaderValue::from_static(Self::UPGRADE_VALUE));
-            res.headers_mut()
-                .append(UPGRADE, HeaderValue::from_static(Self::WEBSOCKET_VALUE));
-            if let Some(derived) = derived {
-                res.headers_mut().append(
-                    SEC_WEBSOCKET_ACCEPT,
-                    derived
-                        .parse()
-                        .map_err(|e| IoError::new(ErrorKind::ConnectionRefused, e))?,
-                );
-            }
-            res.headers_mut()
-                .insert("Access-Control-Allow-Origin", HeaderValue::from_static("*"));
-
-            Ok(res)
+        Ok(EdgyService {
+            command: command_tx,
+            bind_addr: EdgyService::get_bind_addr(self.bind_addr).await?,
+            rt: rt.into(),
+            worker_task,
         })
     }
 }
 
-impl WebHandler {
-    const UPGRADE_VALUE: &str = "Upgrade";
-    const WEBSOCKET_VALUE: &str = "websocket";
-
-    fn new(socket_addr: SocketAddr, command: MpscSender<Command>, rt: Weak<Runtime>) -> Self {
-        Self {
-            socket_addr,
-            command,
-            rt,
-        }
-    }
-
-    /// 从请求头中提取真实的客户端IP地址
-    ///
-    /// 优先级：X-Forwarded-For > X-Real-IP > 直连地址
-    fn extract_real_ip(&self, headers: &HeaderMap) -> SocketAddr {
-        // 尝试从 X-Forwarded-For 头获取IP
-        if let Some(forwarded_for) = headers.get("x-forwarded-for")
-            && let Ok(forwarded_str) = forwarded_for.to_str()
-            && let Some(first_ip) = forwarded_str.split(',').next()
-        {
-            let ip_str = first_ip.trim();
-            if let Ok(ip) = IpAddr::from_str(ip_str) {
-                return SocketAddr::new(ip, self.socket_addr.port());
-            }
-        }
-
-        // 尝试从 X-Real-IP 头获取IP
-        if let Some(real_ip) = headers.get("x-real-ip")
-            && let Ok(ip_str) = real_ip.to_str()
-            && let Ok(ip) = IpAddr::from_str(ip_str.trim())
-        {
-            return SocketAddr::new(ip, self.socket_addr.port());
-        }
-
-        // 如果都没有，返回原始地址
-        self.socket_addr
-    }
-}
-
-#[derive(Debug)]
-enum Command {
-    AddRoute {
-        path: String,
-        stream: MpscSender<(SocketAddr, Message, OneshotSender<Option<Message>>)>,
-        opt_return: OneshotSender<IoResult<()>>,
-    },
-
-    RemoveRoute {
-        path: String,
-        opt_return: OneshotSender<IoResult<()>>,
-    },
-
-    Transfer {
-        path: String,
-        socket_addr: SocketAddr,
-        msg: Message,
-        ret_tx: OneshotSender<Option<Message>>,
-    },
-
-    CallRemotely {
-        path: String,
-        socket_addr: SocketAddr,
-        id: ReqId,
-        msg: Message,
-        ret_tx: OneshotSender<IoResult<Message>>,
-    },
-
-    CommitReturn {
-        path: String,
-        socket_addr: SocketAddr,
-        id: ReqId,
-        msg: Message,
-    },
-}
-
-pub type ServiceAccessor = Accessor<Conn>;
-
-impl AsRef<ServiceAccessor> for ServiceAccessor {
-    fn as_ref(&self) -> &Self {
-        self
-    }
-}
-
-pub struct Conn {
-    path: String,
-    socket_addr: SocketAddr,
-}
-
-impl Conn {
-    pub fn get_addr(&self) -> SocketAddr {
-        self.socket_addr
-    }
-
-    pub fn get_path(&self) -> &str {
-        &self.path
-    }
-
-    pub async fn get_other_conns(&self) -> impl Iterator<Item = ServiceAccessor> {
-        CONNS
-            .lock()
-            .await
-            .keys()
-            .filter(|(path, addr)| path == &self.path && addr != &self.socket_addr)
-            .map(|(_, addr)| Accessor::from(Conn::from((self.path.clone(), *addr))))
-            .collect::<Vec<_>>()
-            .into_iter()
-    }
-}
-
-impl From<(String, SocketAddr)> for Conn {
-    fn from((path, socket_addr): (String, SocketAddr)) -> Self {
-        Self { path, socket_addr }
-    }
-}
-
+/// WebSocket/HTTP server for handling incoming connections and requests.
+///
+/// The service provides both HTTP request routing and WebSocket connection management
+/// with support for bidirectional communication.
+///
+/// # Example
+/// ```no_run
+/// use edgy_s::EdgyService;
+///
+/// #[tokio::main]
+/// async fn main() -> std::io::Result<()> {
+///     let service = EdgyService::builder("0.0.0.0:8080")
+///         .workers(2)
+///         .build()
+///         .await?;
+///     
+///     service.run().await
+/// }
+/// ```
 pub struct EdgyService {
     bind_addr: SocketAddr,
     rt: Arc<Runtime>,
@@ -347,22 +116,28 @@ pub struct EdgyService {
     worker_task: JoinHandle<IoResult<()>>,
 }
 
-impl Router<Conn> for EdgyService {
-    async fn add_route<F, P, Args, Ret>(&self, path: P, handler: F) -> IoResult<()>
+impl WsRouter<WsConn> for EdgyService {
+    type Binding = WsBinding<HttpConn, WsConn>;
+
+    async fn add_route<F, P, Args, Ret>(&self, path: P, handler: F) -> IoResult<Self::Binding>
     where
-        F: AsyncFun<Args, Ret, Conn>,
+        F: WsAsyncFn<Args, Ret, WsConn>,
         Args: for<'a> Deserialize<'a> + Serialize,
         Ret: for<'a> Deserialize<'a> + Serialize + Send,
         P: AsRef<str>,
     {
         let (stream_tx, mut stream_rx) = mpsc_channel(2);
+        let (open_tx, open_rx) = mpsc_channel(2);
+        let (close_tx, close_rx) = mpsc_channel(2);
         let (ret_tx, ret_rx) = oneshot_channel();
         let command = self.command.clone();
         command
-            .send(Command::AddRoute {
+            .send(Command::AddWsRoute {
                 path: path.as_ref().into(),
                 stream: stream_tx,
                 opt_return: ret_tx,
+                open: open_tx,
+                close: close_tx,
             })
             .await
             .map_err(IoError::other)?;
@@ -374,12 +149,13 @@ impl Router<Conn> for EdgyService {
                     path.as_ref()
                 )));
             }
-            lock.insert(path.as_ref().into(), self.command.clone());
+            lock.insert(path.as_ref().into(), self.command.downgrade());
         }
 
         let path = path.as_ref().to_owned();
+        let path2 = path.clone();
         self.rt.spawn(async move {
-            while let Some((socket_addr, msg, ret_tx)) = stream_rx.recv().await {
+            while let Some((uri, socket_addr, headers, msg, ret_tx)) = stream_rx.recv().await {
                 let packet = match Packet::<Args, Ret>::from_message(&msg) {
                     Ok(args) => args,
                     Err(e) => {
@@ -392,7 +168,7 @@ impl Router<Conn> for EdgyService {
                     Packet::Call(id, args) => {
                         let ret = match Packet::<Args, Ret>::make_ret_message(
                             id,
-                            handler.call((path.clone(), socket_addr).into(), args).await,
+                            handler.call((uri, socket_addr, headers).into(), args).await,
                         ) {
                             Ok(r) => r,
                             Err(e) => {
@@ -408,7 +184,7 @@ impl Router<Conn> for EdgyService {
                     Packet::Ret(id, _ret) => {
                         if let Err(e) = command
                             .send(Command::CommitReturn {
-                                path: path.clone(),
+                                path: path2.clone(),
                                 socket_addr,
                                 id,
                                 msg,
@@ -424,52 +200,109 @@ impl Router<Conn> for EdgyService {
                 }
             }
         });
-
         ret_rx.await.map_err(IoError::other)??;
-        Ok(())
+
+        WsBinding::new(
+            path,
+            self.command.downgrade(),
+            Arc::downgrade(&self.rt),
+            open_rx,
+            close_rx,
+        )
     }
 
-    async fn remove_route<P>(&self, path: P) -> IoResult<()>
+    async fn remove_route(binding: Self::Binding) -> IoResult<()> {
+        let path = binding.get_path();
+        BIND_SENDERS.lock().await.remove(path);
+        let (ret_tx, ret_rx) = oneshot_channel();
+        binding
+            .send_command(Command::RemoveWsRoute {
+                path: path.into(),
+                opt_return: ret_tx,
+            })
+            .await?;
+        ret_rx.await.map_err(IoError::other)?
+    }
+}
+
+impl HttpServerRouter<HttpConn> for EdgyService {
+    type Binding = HttpBinding;
+
+    async fn add_route<F, P, Body, Ret>(&self, path: P, handler: F) -> IoResult<Self::Binding>
     where
+        F: HttpServerAsyncFn<Body, Ret, HttpConn>,
+        Body: From<StreamingBody>,
         P: AsRef<str>,
+        Ret: IntoStreamingBody,
     {
-        BIND_SENDERS.lock().await.remove(path.as_ref());
+        let (req_tx, mut req_rx) =
+            mpsc_channel::<(Uri, SocketAddr, HeaderMap, StreamingBody, OneshotSender<_>)>(2);
+        let task = self.rt.spawn(async move {
+            while let Some((uri, addr, headers, body, ret_tx)) = req_rx.recv().await {
+                let (tx, rx) = watch_channel(Default::default());
+                let accessor = (uri, addr, headers, tx).into();
+                let ret = handler.call(accessor, body.into()).await;
+                let response_headers = rx.borrow().clone();
+                if let Err(e) = ret_tx.send((response_headers, ret.into_streaming_body())) {
+                    error!(?e, "Unable to send data.");
+                }
+            }
+        });
+
         let (ret_tx, ret_rx) = oneshot_channel();
         self.command
-            .send(Command::RemoveRoute {
-                path: path.as_ref().into(),
+            .send(Command::AddHttpRoute {
+                task,
+                path: path.as_ref().to_owned(),
+                req_tx,
                 opt_return: ret_tx,
             })
             .await
             .map_err(IoError::other)?;
         ret_rx.await.map_err(IoError::other)??;
 
-        Ok(())
+        Ok(HttpBinding::new(path, self.command.downgrade()))
+    }
+
+    async fn remove_route(binding: Self::Binding) -> IoResult<()> {
+        let (ret_tx, ret_rx) = oneshot_channel();
+        let path = binding.get_path();
+        binding
+            .send_command(Command::RemoveHttpRoute {
+                path: path.into(),
+                opt_return: ret_tx,
+            })
+            .await?;
+        ret_rx.await.map_err(IoError::other)?
     }
 }
 
 impl EdgyService {
-    pub async fn new<Addr>(bind_addr: Addr, num_workers: usize) -> IoResult<Self>
+    /// Creates a new `EdgyService` with default settings.
+    pub async fn new<Addr>(bind_addr: Addr) -> IoResult<Self>
     where
         Addr: ToSocketAddrs,
     {
-        let rt = Builder::new_multi_thread()
-            .worker_threads(num_workers)
-            .enable_all()
-            .build()?;
-
-        let (command_tx, command_rx) = mpsc_channel(2);
-        let worker_task = rt.spawn(Self::worker(command_rx));
-
-        Ok(Self {
-            command: command_tx,
-            bind_addr: Self::get_bind_addr(bind_addr).await?,
-            rt: rt.into(),
-            worker_task,
-        })
+        Self::builder(bind_addr).build().await
     }
 
-    pub async fn run(self) -> IoResult<Self> {
+    /// Creates a builder for configuring the service.
+    pub fn builder<Addr>(bind_addr: Addr) -> EdgyServiceBuilder<Addr>
+    where
+        Addr: ToSocketAddrs,
+    {
+        EdgyServiceBuilder {
+            bind_addr,
+            num_workers: DEFAULT_NUM_WORKERS,
+        }
+    }
+
+    /// Runs the server, accepting incoming connections until aborted.
+    ///
+    /// This method blocks and continuously accepts new connections.
+    /// Each connection is handled in a separate async task.
+    /// The server runs until the internal worker task is finished or aborted.
+    pub async fn run(self) -> IoResult<()> {
         let listener = TcpListener::bind(&self.bind_addr).await?;
         info!("WebSocket server listening on {}", self.bind_addr);
         while !self.worker_task.is_finished() {
@@ -489,54 +322,84 @@ impl EdgyService {
             });
         }
 
-        Ok(self)
+        Ok(())
     }
 
+    /// Aborts the server and all background tasks immediately.
+    ///
+    /// This will terminate all active connections and stop accepting
+    /// new connections. Use this for graceful shutdown.
     pub fn abort(self) {
         self.worker_task.abort();
     }
 
     async fn worker(mut command: MpscReceiver<Command>) -> IoResult<()> {
-        let mut handlers = HashMap::new();
+        let mut http_handlers = HashMap::new();
+        let mut ws_handlers = HashMap::new();
         let mut pending_requests = HashMap::new();
 
         while let Some(item) = command.recv().await {
             match item {
-                Command::AddRoute {
+                Command::AddWsRoute {
                     path,
                     stream,
                     opt_return,
+                    open,
+                    close
                 } => {
                     opt_return
-                        .send(if handlers.contains_key(&path) {
+                        .send(if ws_handlers.contains_key(&path) {
                             Err(IoError::other(format!("Can't add route: {}", path)))
                         } else {
-                            handlers.insert(path, stream);
+                            ws_handlers.insert(path, (stream, open, close));
                             Ok(())
                         })
                         .map_or_else(|e| e.map_err(IoError::other), Ok)?;
                 }
 
-                Command::RemoveRoute { path, opt_return } => {
+                Command::RemoveWsRoute { path, opt_return } => {
                     opt_return
-                        .send(handlers.remove(&path).map_or(
+                        .send(ws_handlers.remove(&path).map_or(
                             Err(IoError::other(format!("Can't remove route: {}", path))),
                             |_| Ok(()),
                         ))
                         .map_or_else(|e| e, Ok)?;
                 }
 
-                Command::Transfer {
+                Command::AddHttpRoute {
+                    task,
                     path,
+                    req_tx,
+                    opt_return
+                } => {
+                    opt_return
+                        .send(if http_handlers.contains_key(&path) {
+                            Err(IoError::other(format!("Can't add route: {}", path)))
+                        } else {
+                            http_handlers.insert(path, (req_tx, task));
+                            Ok(())
+                        })
+                        .map_or_else(|e| e.map_err(IoError::other), Ok)?;
+                }
+
+                Command::RemoveHttpRoute { path, opt_return } => {
+                    opt_return
+                        .send(http_handlers.remove(&path).map_or(
+                            Err(IoError::other(format!("Can't remove route: {}", path))),
+                            |i| Ok(i.1.abort()),
+                        ))
+                        .map_or_else(|e| e, Ok)?;
+                }
+
+                Command::Transfer {
+                    uri,
                     socket_addr,
                     msg,
+                    headers,
                     ret_tx,
                 } => {
-                    if let Some(handler) = handlers.get(&path) {
-                        handler
-                            .send((socket_addr, msg, ret_tx))
-                            .await
-                            .map_or_else(|e| Err(IoError::other(e)), Ok)?;
+                    if let Some((handler, _, _)) = ws_handlers.get(uri.path()) {
+                        handler.send((uri, socket_addr, headers, msg, ret_tx)).await.map_or_else(|e| Err(IoError::other(e)), Ok)?;
                     }
                 }
 
@@ -547,7 +410,7 @@ impl EdgyService {
                     msg,
                     ret_tx,
                 } => {
-                    if let Some(conn) = CONNS.lock().await.get(&(path.clone(), socket_addr)) {
+                    if let Some(conn) = WS_CONNS.lock().await.get(&(path.clone(), socket_addr)) {
                         if let Err(e) = conn.send(msg).await {
                             error!(?e, "Unable to send message.");
                         }
@@ -570,6 +433,34 @@ impl EdgyService {
                         error!(?e, "Unable to commit return message.");
                     }
                 }
+
+                Command::WsOpen { uri, socket_addr, headers, res_tx: response_tx } => {
+                    if let Some((_, open, _)) = ws_handlers.get(uri.path()) {
+                        let (tx, rx) = watch_channel(Default::default());
+                        let accessor: HttpConn = (uri, socket_addr, headers, tx).into();
+                        let (ret_tx, ret_rx) = oneshot_channel();
+                        if let Err(e) = open.send((accessor.into(), ret_tx)).await {
+                            error!(?e, "Unable to open connection.");
+                        } else if let Err(e) = ret_rx.await {
+                            error!(?e, "Unable to send the response.");
+                        } else if let Err(e) = response_tx.send(rx.borrow().clone()) {
+                            error!(?e, "Unable to open connection.");
+                        }
+                    };
+                }
+
+                Command::WsClose {uri, socket_addr, headers} => if let Some((_, _, close)) = ws_handlers.get(uri.path()) {
+                    let accessor: WsConn = (uri, socket_addr, headers).into();
+                    if let Err(e) = close.send(accessor.into()).await {
+                        error!(?e, "Unable to close connection.");
+                    }
+                }
+
+                Command::Request {uri, socket_addr, headers, body, ret_tx} => {
+                    if let Some((handler, _)) = http_handlers.get(uri.path()) {
+                        handler.send((uri, socket_addr, headers, body, ret_tx)).await.map_or_else(|e| Err(IoError::other(e)), Ok)?;
+                    }
+                }
             }
         }
 
@@ -585,60 +476,6 @@ impl EdgyService {
                 ErrorKind::NotFound,
                 "Unable to obtain host address.",
             ))
-        }
-    }
-}
-
-pub trait ClientCaller<Args, Ret> {
-    fn call_remotely<T>(self, target: T) -> impl Future<Output = IoResult<Ret>>
-    where
-        T: AsRef<ServiceAccessor>;
-}
-
-impl<Args, Ret> ClientCaller<Args, Ret> for Args
-where
-    Args: for<'a> Deserialize<'a> + Serialize,
-    Ret: for<'a> Deserialize<'a> + Serialize,
-{
-    async fn call_remotely<T>(self, target: T) -> IoResult<Ret>
-    where
-        T: AsRef<ServiceAccessor>,
-    {
-        static AUTO_ID: AtomicReqId = AtomicReqId::new(0);
-
-        let path = target.as_ref().get_path();
-        let socket_addr = target.as_ref().get_addr();
-        let Some(command) = BIND_SENDERS.lock().await.get(path).map(|i| i.clone()) else {
-            return Err(IoError::other(format!(
-                "The connection with the `{}` address cannot be sent to the `{}` path to call the remote function, because the function is not bound to the server.",
-                socket_addr, path,
-            )));
-        };
-
-        let req_id = AUTO_ID
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| {
-                Some(v.wrapping_add(1))
-            })
-            .unwrap_or_default();
-        let (tx, rx) = oneshot_channel();
-        command
-            .send(Command::CallRemotely {
-                path: path.to_owned(),
-                socket_addr,
-                id: req_id,
-                msg: Packet::<Args, Ret>::make_call_message(req_id, self)?,
-                ret_tx: tx,
-            })
-            .await
-            .map_err(IoError::other)?;
-
-        match Packet::<Args, Ret>::from_message(&rx.await.map_err(IoError::other)??)? {
-            Packet::Ret(id, _) if id != req_id => Err(IoError::other(format!(
-                "The received message ID does not match the request ID: {} != {}",
-                id, req_id
-            ))),
-            Packet::Ret(_id, ret) => Ok(ret),
-            _ => Err(IoError::other("Unable to decode packet.")),
         }
     }
 }
