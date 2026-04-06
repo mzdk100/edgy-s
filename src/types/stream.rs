@@ -1,3 +1,5 @@
+#[cfg(feature = "serde_json")]
+use serde_json::{Value, from_slice, to_vec};
 use {
     futures_util::{Stream, StreamExt},
     hyper::{
@@ -196,6 +198,7 @@ where
         }
     }
 }
+
 impl IntoStreamingBody for () {
     fn into_streaming_body(self) -> StreamingBody {
         StreamingBody::Null
@@ -277,5 +280,26 @@ impl FromBytes for Vec<u8> {
 impl FromBytes for Box<[u8]> {
     fn from(value: Bytes) -> Self {
         value.to_vec().into()
+    }
+}
+
+#[cfg(feature = "serde_json")]
+impl FromBytes for Value {
+    fn from(value: Bytes) -> Self {
+        from_slice(&value).unwrap_or_default()
+    }
+}
+
+#[cfg(feature = "serde_json")]
+impl IntoStreamingBody for Value {
+    fn into_streaming_body(self) -> StreamingBody {
+        to_vec(&self).unwrap_or_default().into_streaming_body()
+    }
+}
+
+#[cfg(feature = "serde_json")]
+impl From<Value> for StreamingBody {
+    fn from(value: Value) -> Self {
+        to_vec(&value).unwrap_or_default().into_streaming_body()
     }
 }

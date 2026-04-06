@@ -9,3 +9,6 @@ mod utils;
 
 #[cfg(any(feature = "server", feature = "client"))]
 pub use {types::*, utils::*};
+
+#[cfg(feature = "serde_json")]
+pub use serde_json;
