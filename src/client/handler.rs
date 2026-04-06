@@ -1,9 +1,11 @@
 use {
     super::{
-        super::types::{IntoStreamingBody, Packet, ReqId, StreamingBody, WsAsyncFn},
-        super::utils::append_query_params,
-        ErrorKind, IoError, IoResult, MpscReceiver, OneshotSender, RequestAccessor, RequestConn,
-        ResponseConn, WsAccessor,
+        super::{
+            types::{IntoStreamingBody, Packet, ReqId, State, StreamingBody, WsAsyncFn},
+            utils::append_query_params,
+        },
+        ErrorKind, HttpAccessor, IoError, IoResult, MpscReceiver, OneshotSender, RequestAccessor,
+        RequestConn, ResponseConn,
         conn::WsConnGuard,
         oneshot_channel,
     },
@@ -16,10 +18,8 @@ use {
         header::HeaderMap,
         http::{StatusCode, Uri},
     },
-    hyper_util::{
-        client::legacy::{Client, connect::HttpConnector},
-        rt::TokioExecutor,
-    },
+    hyper_tls::HttpsConnector,
+    hyper_util::{client::legacy::Client, rt::TokioExecutor},
     serde::{Deserialize, Serialize},
     std::collections::HashMap,
     tokio::{
@@ -37,17 +37,19 @@ pub(super) type WsCall = (ReqId, Message, OneshotSender<Message>);
 
 /// Single WebSocket connection dispatch without reconnection logic.
 /// Sends open signal immediately after successful connection if provided.
-pub(super) async fn ws_dispatch<F, Args, Ret>(
+pub(super) async fn ws_dispatch<F, Args, Ret, S>(
     uri: Uri,
     mut headers: HeaderMap,
     call_rx: &mut MpscReceiver<WsCall>,
     handler: F,
-    open_tx: &mut Option<OneshotSender<WsAccessor>>,
+    response_tx: OneshotSender<(StatusCode, HeaderMap)>,
+    state: State<S>,
 ) -> IoResult<Option<CloseFrame>>
 where
-    F: WsAsyncFn<Args, Ret, ResponseConn>,
+    F: WsAsyncFn<Args, Ret, ResponseConn<S>, S>,
     Args: for<'a> Deserialize<'a> + Serialize,
     Ret: for<'a> Deserialize<'a> + Serialize,
+    S: std::fmt::Debug,
 {
     let mut request = uri
         .clone()
@@ -62,16 +64,9 @@ where
     // Extract status code and headers from the WebSocket handshake response
     let status = response.status();
     let response_headers = response.headers().clone();
-
-    // Send open signal immediately after successful connection
-    if let Some(tx) = open_tx.take() {
-        let accessor: ResponseConn = (uri.clone(), status, response_headers).into();
-        if let Err(e) = tx.send(accessor.into()) {
-            error!(?e, "Failed to send open signal.");
-        } else {
-            info!("WebSocket connection opened: {}", uri);
-        }
-    }
+    response_tx
+        .send((status, response_headers.clone()))
+        .map_err(|_| IoError::other("Failed to send response"))?;
 
     let (mut write, mut read) = stream.split();
     let mut pending_requests = HashMap::<_, OneshotSender<_>>::new();
@@ -83,9 +78,16 @@ where
 
             Either::Left((Some(Ok(msg)), _)) => match Packet::<Args, Ret>::from_message(&msg) {
                 Ok(Packet::Call(id, args)) => {
+                    let accessor = ResponseConn::from((
+                        uri.clone(),
+                        status,
+                        response_headers.clone(),
+                        state.clone(),
+                    ))
+                    .into();
                     let ret = match Packet::<Args, Ret>::make_ret_message(
                         id,
-                        handler.call(uri.clone().into(), args).await,
+                        handler.call(accessor, args).await,
                     ) {
                         Ok(r) => r,
                         Err(e) => {
@@ -124,25 +126,27 @@ where
 
 /// WebSocket dispatch with automatic reconnection.
 /// Manages open/close signals: sends open on first successful connection, close on final exit.
-pub(super) async fn ws_dispatch_with_auto_reconnection<F, Args, Ret>(
+pub(super) async fn ws_dispatch_with_auto_reconnection<F, Args, Ret, S>(
     uri: Uri,
-    request_tx: OneshotSender<(RequestAccessor, OneshotSender<()>)>,
+    request_tx: OneshotSender<(RequestAccessor<S>, OneshotSender<()>)>,
     mut call_rx: MpscReceiver<WsCall>,
     handler: F,
-    open_tx: OneshotSender<WsAccessor>,
-    close_tx: OneshotSender<WsAccessor>,
+    open_tx: OneshotSender<HttpAccessor<S>>,
+    close_tx: OneshotSender<HttpAccessor<S>>,
     max_retries: usize,
     retry_interval: Duration,
+    state: State<S>,
 ) where
-    F: WsAsyncFn<Args, Ret, ResponseConn>,
+    F: WsAsyncFn<Args, Ret, ResponseConn<S>, S>,
     Args: for<'a> Deserialize<'a> + Serialize,
     Ret: for<'a> Deserialize<'a> + Serialize,
+    S: Send + std::fmt::Debug + 'static,
 {
     let (header_tx, header_rx) = watch_channel::<HeaderMap>(Default::default());
     let (query_tx, query_rx) = watch_channel::<HashMap<String, String>>(Default::default());
-    let accessor: RequestConn = (uri.clone(), header_tx, query_tx).into();
+    let accessor = RequestConn::<S>::from((uri.clone(), header_tx, query_tx, state.clone())).into();
     let (ret_tx, ret_rx) = oneshot_channel();
-    let headers = if let Err(e) = request_tx.send((accessor.into(), ret_tx)) {
+    let headers = if let Err(e) = request_tx.send((accessor, ret_tx)) {
         error!(?e, "Can't send the request.");
         HeaderMap::new()
     } else if let Err(e) = ret_rx.await {
@@ -156,19 +160,70 @@ pub(super) async fn ws_dispatch_with_auto_reconnection<F, Args, Ret>(
     let uri = append_query_params(&uri, &query_params);
 
     // Guard ensures close signal is sent on final exit
-    let mut guard = WsConnGuard::new(open_tx, close_tx, uri.clone());
+    let mut guard = WsConnGuard::new();
+    let mut close_tx = Some(close_tx);
+    let mut open_tx = Some(open_tx);
 
     for attempt in 0..max_retries {
-        // Pass mutable reference so open_tx is only consumed on successful connection
-        match ws_dispatch(
+        let (response_tx, response_rx) = oneshot_channel();
+        let mut response_fut = Box::pin(ws_dispatch(
             uri.clone(),
             headers.clone(),
             &mut call_rx,
             handler,
-            &mut guard.open_tx,
-        )
-        .await
-        {
+            response_tx,
+            state.clone(),
+        ));
+        let (status_code, response_headers) = match select(response_rx, response_fut).await {
+            Either::Left((Ok(r), fut)) => {
+                response_fut = fut;
+                r
+            }
+            Either::Left((Err(e), fut)) => {
+                warn!(?e, "Connection attempt failed, retrying...");
+                if attempt < max_retries - 1 {
+                    sleep(retry_interval).await;
+                }
+                response_fut = fut;
+                continue;
+            }
+            _ => {
+                error!("Error in WebSocket connection.");
+                break;
+            }
+        };
+
+        // Send open signal immediately after successful connection
+        if let Some(tx) = open_tx.take() {
+            if let Err(e) = tx.send(
+                ResponseConn::from((
+                    uri.clone(),
+                    status_code,
+                    response_headers.clone(),
+                    state.clone(),
+                ))
+                .into(),
+            ) {
+                warn!(?e, "Can't send the open signal.");
+            } else {
+                info!("WebSocket connection opened: {}", uri);
+            }
+        }
+        if let Some(tx) = close_tx.take() {
+            guard.close_tx = Some((
+                tx,
+                ResponseConn::from((
+                    uri.clone(),
+                    status_code,
+                    response_headers.clone(),
+                    state.clone(),
+                ))
+                .into(),
+            ));
+        }
+
+        // Pass mutable reference so open_tx is only consumed on successful connection
+        match response_fut.await {
             Ok(close_frame) => {
                 // Normal close, exit the reconnection loop
                 if let Some(frame) = close_frame {
@@ -177,13 +232,7 @@ pub(super) async fn ws_dispatch_with_auto_reconnection<F, Args, Ret>(
                 return;
             }
             Err(e) => {
-                if guard.open_tx.is_some() {
-                    // open_tx not consumed means connection never succeeded
-                    warn!(?e, "Connection attempt failed, retrying...");
-                } else {
-                    // open_tx consumed means connection was once successful but now disconnected
-                    warn!(?e, attempt, "Connection lost, reconnecting...");
-                }
+                warn!(?e, attempt, "Connection lost, reconnecting...");
                 // Wait before retrying (except on last attempt)
                 if attempt < max_retries - 1 {
                     sleep(retry_interval).await;
@@ -207,8 +256,8 @@ pub type HttpCall = (
 );
 
 pub(super) async fn http_dispatch(mut request_rx: MpscReceiver<HttpCall>) {
-    let client: Client<HttpConnector, StreamingBody> =
-        Client::builder(TokioExecutor::new()).build_http();
+    let connector = HttpsConnector::new();
+    let client: Client<_, StreamingBody> = Client::builder(TokioExecutor::new()).build(connector);
 
     while let Some((uri, method, headers, body, response_tx)) = request_rx.recv().await {
         let mut builder = Request::builder().method(method).uri(uri);

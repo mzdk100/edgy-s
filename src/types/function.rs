@@ -1,16 +1,16 @@
 #[cfg(feature = "client")]
 use super::HttpClientRouter;
 #[cfg(feature = "server")]
-use super::HttpServerRouter;
+use super::{HttpServerRouter, IntoStreamingBody, StreamingBody};
 use {
-    super::{Accessor, IoResult, WsRouter},
+    super::{super::get_path, Accessor, IoResult, WsRouter},
     serde::{Deserialize, Serialize},
 };
 
 /// Trait for async functions that can handle WebSocket messages.
 ///
 /// This trait is automatically implemented for async functions that:
-/// - Take an `Accessor<Acc>` as the first argument
+/// - Take an `Accessor<Acc, S>` as the first argument
 /// - Take up to 26 additional serializable arguments
 /// - Return a serializable type
 ///
@@ -23,13 +23,13 @@ use {
 /// // Can be bound to a WebSocket route
 /// my_handler.bind(&client).await?;
 /// ```
-pub trait WsAsyncFn<Args, Ret, Acc>
+pub trait WsAsyncFn<Args, Ret, Acc, S = ()>
 where
     Self: Copy + Send + 'static,
 {
     fn bind_by_path<R, P>(self, router: &R, path: P) -> impl Future<Output = IoResult<R::Binding>>
     where
-        R: WsRouter<Acc>,
+        R: WsRouter<Acc, S>,
         P: AsRef<str> + Send + Sync + 'static,
         Args: for<'a> Deserialize<'a> + Serialize + 'static,
         Ret: for<'a> Deserialize<'a> + Serialize + Send + 'static,
@@ -39,26 +39,26 @@ where
 
     fn bind<R>(self, router: &R) -> impl Future<Output = IoResult<R::Binding>>
     where
-        R: WsRouter<Acc>,
+        R: WsRouter<Acc, S>,
         Args: for<'a> Deserialize<'a> + Serialize + 'static,
         Ret: for<'a> Deserialize<'a> + Serialize + Send + 'static,
     {
-        router.add_route::<_, _, Args, Ret>(crate::utils::get_path::<Self>(), self)
+        router.add_route::<_, _, Args, Ret>(get_path::<Self>(), self)
     }
 
-    fn call(self, accessor: Acc, args: Args) -> impl Future<Output = Ret> + Send;
+    fn call(self, accessor: Accessor<Acc>, args: Args) -> impl Future<Output = Ret> + Send;
 }
 
 macro_rules! impl_ws_async_fn {
     ($($t:ident : $T:ident),* $(,)?) => {
-        impl<Fun, Fut, Ret, Acc, $($T,)*> WsAsyncFn<($($T,)*), Ret, Acc> for Fun
+        impl<Fun, Fut, Ret, Acc, State, $($T,)*> WsAsyncFn<($($T,)*), Ret, Acc, State> for Fun
         where
             Fut: Future<Output = Ret> + Send + 'static,
             Fun: Fn(Accessor<Acc>, $($T,)*) -> Fut + Copy + Send + 'static,
             $($T: Send,)*
         {
-            fn call(self, accessor: Acc, ($($t,)*): ($($T,)*)) -> impl Future<Output = Ret> + Send {
-                self(accessor.into(), $($t),*)
+            fn call(self, accessor: Accessor<Acc>, ($($t,)*): ($($T,)*)) -> impl Future<Output = Ret> + Send {
+                self(accessor, $($t),*)
             }
         }
     }
@@ -95,7 +95,7 @@ impl_ws_async_fn!(a: A, b: B, c: C, d: D, e: E, f: F, g: G, h: H, i: I, j: J, k:
 /// Trait for async functions that can handle HTTP requests (server-side).
 ///
 /// This trait is automatically implemented for async functions that:
-/// - Take an `Accessor<Acc>` as the first argument
+/// - Take an `Accessor<Acc, S>` as the first argument
 /// - Take a body type that implements `From<StreamingBody>`
 /// - Return a type that implements `IntoStreamingBody`
 ///
@@ -121,8 +121,8 @@ where
     where
         R: HttpServerRouter<Acc>,
         P: AsRef<str> + Send + Sync + 'static,
-        Body: From<crate::types::stream::StreamingBody>,
-        Ret: crate::types::stream::IntoStreamingBody,
+        Body: From<StreamingBody>,
+        Ret: IntoStreamingBody,
     {
         router.add_route::<_, _, Body, Ret>(path, self)
     }
@@ -130,36 +130,36 @@ where
     fn bind_as_response<R>(self, router: &R) -> impl Future<Output = IoResult<R::Binding>>
     where
         R: HttpServerRouter<Acc>,
-        Body: From<crate::types::stream::StreamingBody>,
-        Ret: crate::types::stream::IntoStreamingBody,
+        Body: From<StreamingBody>,
+        Ret: IntoStreamingBody,
     {
-        router.add_route::<_, _, Body, Ret>(crate::utils::get_path::<Self>(), self)
+        router.add_route::<_, _, Body, Ret>(get_path::<Self>(), self)
     }
 
-    fn call(self, accessor: Acc, body: Body) -> impl Future<Output = Ret> + Send;
+    fn call(self, accessor: Accessor<Acc>, body: Body) -> impl Future<Output = Ret> + Send;
 }
 
 #[cfg(feature = "server")]
 impl<Fun, Fut, Body, Ret, Acc> HttpServerAsyncFn<Body, Ret, Acc> for Fun
 where
     Fut: Future<Output = Ret> + Send + 'static,
-    Fun: for<'a> Fn(crate::types::Accessor<Acc>, Body) -> Fut + Copy + Send + 'static,
+    Fun: for<'a> Fn(Accessor<Acc>, Body) -> Fut + Copy + Send + 'static,
     Body: Send,
 {
-    fn call(self, accessor: Acc, body: Body) -> impl Future<Output = Ret> + Send {
-        self(accessor.into(), body)
+    fn call(self, accessor: Accessor<Acc>, body: Body) -> impl Future<Output = Ret> + Send {
+        self(accessor, body)
     }
 }
 
 /// Trait for async functions that can handle HTTP requests (client-side).
 ///
 /// This trait is automatically implemented for async functions that:
-/// - Take an `Accessor<Acc>` as the only argument
+/// - Take an `Accessor<Acc, S>` as the only argument
 /// - Return `()`
 ///
 /// Used for binding HTTP request handlers on the client side.
 #[cfg(feature = "client")]
-pub trait HttpClientAsyncFn<Acc>
+pub trait HttpClientAsyncFn<Acc, S = ()>
 where
     Self: Copy + Send + 'static,
 {
@@ -169,7 +169,7 @@ where
         path: P,
     ) -> impl Future<Output = IoResult<R::Binding>>
     where
-        R: HttpClientRouter<Acc>,
+        R: HttpClientRouter<Acc, S>,
         P: AsRef<str> + Send + Sync + 'static,
     {
         router.add_route::<_, _>(path, self)
@@ -177,21 +177,21 @@ where
 
     fn bind_as_request<R>(self, router: &R) -> impl Future<Output = IoResult<R::Binding>>
     where
-        R: HttpClientRouter<Acc>,
+        R: HttpClientRouter<Acc, S>,
     {
-        router.add_route::<_, _>(crate::utils::get_path::<Self>(), self)
+        router.add_route::<_, _>(get_path::<Self>(), self)
     }
 
-    fn call(self, accessor: Acc) -> impl Future<Output = ()> + Send;
+    fn call(self, accessor: Accessor<Acc>) -> impl Future<Output = ()> + Send;
 }
 
 #[cfg(feature = "client")]
-impl<Fun, Fut, Acc> HttpClientAsyncFn<Acc> for Fun
+impl<Fun, Fut, Acc, S> HttpClientAsyncFn<Acc, S> for Fun
 where
     Fut: Future<Output = ()> + Send + 'static,
     Fun: for<'a> Fn(Accessor<Acc>) -> Fut + Copy + Send + 'static,
 {
-    fn call(self, accessor: Acc) -> impl Future<Output = ()> + Send {
-        self(accessor.into())
+    fn call(self, accessor: Accessor<Acc>) -> impl Future<Output = ()> + Send {
+        self(accessor)
     }
 }

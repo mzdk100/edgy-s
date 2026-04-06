@@ -15,12 +15,13 @@
 - **特性开关** - 按需引入客户端/服务端功能
 - **自动重连** - WebSocket 客户端支持可配置的重试逻辑
 - **Builder 模式** - 灵活的客户端/服务端配置
+- **共享状态** - 内置基于 `Arc<RwLock<S>>` 的状态管理，支持并发访问
 
 ## 安装
 
 ```toml
 [dependencies]
-edgy-s = { version = "1.0", features = ["server", "client"] }
+edgy-s = { version = "1.1", features = ["server", "client"] }
 ```
 
 ## 快速开始
@@ -318,8 +319,105 @@ binding
 
 ```toml
 [dependencies]
-edgy-s = { version = "1.0", features = ["server", "client", "req_id_u32"] }
+edgy-s = { version = "1.1", features = ["server", "client", "req_id_u32"] }
 ```
+
+## 共享状态管理
+
+`EdgyService` 和 `EdgyClient` 支持共享状态，用于管理跨连接的应用数据。
+
+### 带状态的服务端
+
+```rust
+use edgy_s::{
+    Binding, WsAsyncFn,
+    server::{EdgyService, WsAccessor, HttpAccessor},
+};
+
+// 定义你的状态类型
+#[derive(Debug, Default)]
+struct AppState {
+    user_count: u32,
+    messages: Vec<String>,
+}
+
+#[tokio::main]
+async fn main() -> std::io::Result<()> {
+    // 创建带状态的服务
+    let service: EdgyService<AppState> = EdgyService::builder_with_state(
+        "0.0.0.0:8080",
+        AppState::default(),
+    )
+    .workers(4)
+    .build()
+    .await?;
+    
+    // 在处理器中通过 accessor 访问状态
+    // ...
+    
+    service.run().await
+}
+
+// 在 WebSocket 处理器中访问状态
+async fn my_handler(accessor: WsAccessor<AppState>, data: String) -> String {
+    // 读取状态
+    let state = accessor.borrow().await;
+    println!("用户数: {}", state.user_count);
+    drop(state);
+    
+    // 修改状态
+    let mut state = accessor.borrow_mut().await;
+    state.messages.push(data);
+    format!("已收到第 {} 条消息", state.messages.len())
+}
+
+// on_open 接收 HttpAccessor（WebSocket 升级前）
+async fn on_open(accessor: HttpAccessor<AppState>) {
+    let mut state = accessor.borrow_mut().await;
+    state.user_count += 1;
+}
+```
+
+### 带状态的客户端
+
+```rust
+use edgy_s::{
+    Binding, WsAsyncFn,
+    client::{EdgyClient, WsAccessor},
+};
+
+#[derive(Debug, Default)]
+struct ClientState {
+    request_count: u32,
+}
+
+#[tokio::main]
+async fn main() -> std::io::Result<()> {
+    let client: EdgyClient<ClientState> = EdgyClient::builder_with_state(
+        "ws://localhost:8080",
+        ClientState::default(),
+    )?
+    .workers(2)
+    .build()?;
+    
+    // ...
+    
+    client.run().await
+}
+
+async fn handler(accessor: WsAccessor<ClientState>, msg: String) -> String {
+    let state = accessor.borrow().await;
+    println!("已发送请求: {}", state.request_count);
+    "ok".into()
+}
+```
+
+### 状态访问方法
+
+| 方法 | 描述 |
+|------|------|
+| `borrow().await` | 获取读锁守卫（`Ref<S>`）- 支持多个并发读取 |
+| `borrow_mut().await` | 获取写锁守卫（`RefMut<S>`）- 独占访问 |
 
 ## 特性开关
 

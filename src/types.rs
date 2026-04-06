@@ -1,3 +1,4 @@
+mod accessor;
 mod function;
 mod router;
 mod stream;
@@ -8,12 +9,11 @@ use {
     std::{
         fmt::Debug,
         io::{Error as IoError, Result as IoResult},
-        ops::{Deref, DerefMut},
     },
     tokio_tungstenite::tungstenite::Message,
 };
 
-pub use {function::*, router::*, stream::*};
+pub use {accessor::*, function::*, router::*, stream::*};
 
 /// Request ID type based on selected feature flag
 /// Priority: u64 > u32 > u16 > u8 (default)
@@ -84,34 +84,6 @@ impl<A, B> Packet<A, B> {
                 .map_err(IoError::other)?
                 .into(),
         ))
-    }
-}
-
-/// A wrapper type that provides accessor functionality for connection types.
-///
-/// This type wraps inner connection types and provides deref access
-/// to the underlying connection data.
-#[derive(Debug)]
-pub struct Accessor<I> {
-    inner: I,
-}
-
-impl<I> Deref for Accessor<I> {
-    type Target = I;
-    fn deref(&self) -> &Self::Target {
-        &self.inner
-    }
-}
-
-impl<I> DerefMut for Accessor<I> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.inner
-    }
-}
-
-impl<I> From<I> for Accessor<I> {
-    fn from(inner: I) -> Self {
-        Self { inner }
     }
 }
 

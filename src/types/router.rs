@@ -61,7 +61,11 @@ impl<Cmd> BaseBinding<Cmd> {
 /// Trait for routers that handle WebSocket routes.
 ///
 /// Implemented by types that can register and manage WebSocket routes.
-pub trait WsRouter<Acc> {
+///
+/// # Type Parameters
+/// - `Acc`: The accessor type for connections
+/// - `S`: The shared state type (defaults to `()`)
+pub trait WsRouter<Acc, S = ()> {
     type Binding;
 
     fn add_route<F, P, Args, Ret>(
@@ -70,7 +74,7 @@ pub trait WsRouter<Acc> {
         handler: F,
     ) -> impl Future<Output = IoResult<Self::Binding>>
     where
-        F: WsAsyncFn<Args, Ret, Acc>,
+        F: WsAsyncFn<Args, Ret, Acc, S>,
         Args: for<'a> Deserialize<'a> + Serialize + 'static,
         Ret: for<'a> Deserialize<'a> + Serialize + Send + 'static,
         P: AsRef<str>;
@@ -80,12 +84,12 @@ pub trait WsRouter<Acc> {
 
 /// Trait for HTTP request routing.
 #[cfg(feature = "client")]
-pub trait HttpClientRouter<Acc> {
+pub trait HttpClientRouter<Acc, S = ()> {
     type Binding;
 
     fn add_route<F, P>(&self, path: P, handler: F) -> impl Future<Output = IoResult<Self::Binding>>
     where
-        F: HttpClientAsyncFn<Acc>,
+        F: HttpClientAsyncFn<Acc, S>,
         P: AsRef<str>;
 
     fn remove_route(binding: Self::Binding) -> impl Future<Output = IoResult<()>>;
@@ -93,7 +97,7 @@ pub trait HttpClientRouter<Acc> {
 
 /// Trait for routers that handle HTTP routes (server-side).
 #[cfg(feature = "server")]
-pub trait HttpServerRouter<Acc> {
+pub trait HttpServerRouter<Acc, S = ()> {
     type Binding;
 
     fn add_route<F, P, Body, Ret>(

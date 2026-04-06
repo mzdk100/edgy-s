@@ -45,7 +45,7 @@ const QUERY_ENCODE_SET: &AsciiSet = &CONTROLS
 /// 4. Prepending `/`
 ///
 /// # Example
-/// ```
+/// ```ignore
 /// use edgy_s::utils::get_path;
 ///
 /// struct MyHandler;

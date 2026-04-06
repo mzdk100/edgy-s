@@ -1,45 +1,44 @@
 use {
-    super::{Accessor, OneshotSender},
+    super::{
+        super::types::{Ref, RefMut, State},
+        Accessor, OneshotSender,
+    },
     hyper::{
         header::{HeaderMap, HeaderName, HeaderValue},
         http::{StatusCode, Uri},
     },
-    std::{collections::HashMap, io::Error as IoError, ops::Deref, str::FromStr},
+    std::{collections::HashMap, fmt::Debug, io::Error as IoError, ops::Deref, str::FromStr},
     tokio::sync::watch::Sender as WatchSender,
     tracing::{error, info},
 };
 
 /// RAII guard to ensure close signal is sent when the reconnection loop exits.
-pub(super) struct WsConnGuard {
-    pub(super) open_tx: Option<OneshotSender<WsAccessor>>,
-    close_tx: Option<OneshotSender<WsAccessor>>,
-    uri: Uri,
+pub(super) struct WsConnGuard<S = ()>
+where
+    S: Debug,
+{
+    pub close_tx: Option<(OneshotSender<HttpAccessor<S>>, WsAccessor<S>)>,
 }
 
-impl WsConnGuard {
-    pub(super) fn new(
-        open_tx: OneshotSender<WsAccessor>,
-        close_tx: OneshotSender<WsAccessor>,
-        uri: Uri,
-    ) -> Self {
-        Self {
-            open_tx: open_tx.into(),
-            close_tx: close_tx.into(),
-            uri,
-        }
+impl<S> WsConnGuard<S>
+where
+    S: Debug,
+{
+    pub(super) fn new() -> Self {
+        Self { close_tx: None }
     }
 }
 
-impl Drop for WsConnGuard {
+impl<S> Drop for WsConnGuard<S>
+where
+    S: Debug,
+{
     fn drop(&mut self) {
-        if let Some(close_tx) = self.close_tx.take()
-            && self.open_tx.is_none()
-        {
-            let accessor: ResponseConn = self.uri.clone().into();
-            if let Err(e) = close_tx.send(accessor.into()) {
+        if let Some((close_tx, accessor)) = self.close_tx.take() {
+            info!("WebSocket connection closed: {}", accessor.as_uri());
+            if let Err(e) = close_tx.send(accessor) {
                 error!(?e, "Failed to send close signal.");
             }
-            info!("WebSocket connection closed: {}", self.uri);
         }
     }
 }
@@ -48,17 +47,30 @@ impl Drop for WsConnGuard {
 ///
 /// Provides access to the request URI via `Deref`.
 #[derive(Debug)]
-pub struct BaseConn {
+pub struct BaseConn<S = ()> {
+    state: State<S>,
     uri: Uri,
 }
 
-impl From<Uri> for BaseConn {
-    fn from(value: Uri) -> Self {
-        Self { uri: value }
+impl<S> BaseConn<S> {
+    /// Returns a reference to the shared state.
+    pub async fn borrow(&self) -> Ref<'_, S> {
+        Ref::new(self.state.read().await)
+    }
+
+    /// Returns a clone of the state Arc.
+    pub async fn borrow_mut(&self) -> RefMut<'_, S> {
+        RefMut::new(self.state.write().await)
     }
 }
 
-impl Deref for BaseConn {
+impl<S> From<(Uri, State<S>)> for BaseConn<S> {
+    fn from((uri, state): (Uri, State<S>)) -> Self {
+        Self { uri, state }
+    }
+}
+
+impl<S> Deref for BaseConn<S> {
     type Target = Uri;
 
     fn deref(&self) -> &Self::Target {
@@ -70,13 +82,17 @@ impl Deref for BaseConn {
 ///
 /// Provides access to response status code and headers.
 #[derive(Debug)]
-pub struct ResponseConn {
-    base: BaseConn,
+pub struct ResponseConn<S = ()> {
+    base: BaseConn<S>,
     status: StatusCode,
     response_headers: HeaderMap,
 }
 
-impl ResponseConn {
+impl<S> ResponseConn<S> {
+    fn as_uri(&self) -> &Uri {
+        &self.base.uri
+    }
+
     /// Returns the HTTP status code.
     pub fn status(&self) -> StatusCode {
         self.status
@@ -102,28 +118,20 @@ impl ResponseConn {
     }
 }
 
-impl Deref for ResponseConn {
-    type Target = BaseConn;
+impl<S> Deref for ResponseConn<S> {
+    type Target = BaseConn<S>;
 
     fn deref(&self) -> &Self::Target {
         &self.base
     }
 }
 
-impl From<Uri> for ResponseConn {
-    fn from(value: Uri) -> Self {
+impl<S> From<(Uri, StatusCode, HeaderMap, State<S>)> for ResponseConn<S> {
+    fn from(
+        (uri, status, response_headers, state): (Uri, StatusCode, HeaderMap, State<S>),
+    ) -> Self {
         Self {
-            base: value.into(),
-            status: StatusCode::default(),
-            response_headers: Default::default(),
-        }
-    }
-}
-
-impl From<(Uri, StatusCode, HeaderMap)> for ResponseConn {
-    fn from((uri, status, response_headers): (Uri, StatusCode, HeaderMap)) -> Self {
-        Self {
-            base: uri.into(),
+            base: (uri, state).into(),
             status,
             response_headers,
         }
@@ -135,36 +143,38 @@ impl From<(Uri, StatusCode, HeaderMap)> for ResponseConn {
 /// Allows setting request headers and query parameters before
 /// the request is sent to the server.
 #[derive(Debug)]
-pub struct RequestConn {
-    base: BaseConn,
+pub struct RequestConn<S = ()> {
+    base: BaseConn<S>,
     request_headers: WatchSender<HeaderMap>,
     query_params: WatchSender<HashMap<String, String>>,
 }
 
-impl Deref for RequestConn {
-    type Target = BaseConn;
+impl<S> Deref for RequestConn<S> {
+    type Target = BaseConn<S>;
 
     fn deref(&self) -> &Self::Target {
         &self.base
     }
 }
 
-impl
+impl<S>
     From<(
         Uri,
         WatchSender<HeaderMap>,
         WatchSender<HashMap<String, String>>,
-    )> for RequestConn
+        State<S>,
+    )> for RequestConn<S>
 {
     fn from(
-        (uri, request_headers, query_params): (
+        (uri, request_headers, query_params, state): (
             Uri,
             WatchSender<HeaderMap>,
             WatchSender<HashMap<String, String>>,
+            State<S>,
         ),
     ) -> Self {
         Self {
-            base: uri.into(),
+            base: (uri, state).into(),
             request_headers,
             query_params,
         }
@@ -229,14 +239,14 @@ impl RequestConn {
 /// Type alias for WebSocket connection accessor (client-side).
 ///
 /// Provides access to `ResponseConn` methods for WebSocket connections.
-pub type WsAccessor = Accessor<ResponseConn>;
+pub type WsAccessor<S = ()> = Accessor<ResponseConn<S>>;
 
 /// Type alias for HTTP connection accessor (client-side).
 ///
 /// Provides access to `ResponseConn` methods for HTTP responses.
-pub type HttpAccessor = Accessor<ResponseConn>;
+pub type HttpAccessor<S = ()> = Accessor<ResponseConn<S>>;
 
 /// Type alias for request connection accessor (client-side).
 ///
 /// Provides access to `RequestConn` methods for setting up requests.
-pub type RequestAccessor = Accessor<RequestConn>;
+pub type RequestAccessor<S = ()> = Accessor<RequestConn<S>>;

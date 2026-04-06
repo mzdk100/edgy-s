@@ -1,5 +1,5 @@
 use {
-    super::{Command, IntoStreamingBody, StreamingBody, TokioIo},
+    super::{Command, IntoStreamingBody, StreamingBody, TokioIo, conn::WsConnGuard},
     futures_util::{
         SinkExt, StreamExt,
         future::{Either, select},
@@ -136,7 +136,7 @@ impl WebHandler {
 
     pub(super) fn new(
         socket_addr: SocketAddr,
-        command: MpscSender<crate::server::command::Command>,
+        command: MpscSender<Command>,
         rt: Weak<Runtime>,
     ) -> Self {
         Self {
@@ -147,7 +147,7 @@ impl WebHandler {
     }
 
     async fn http_dispatch(
-        command: MpscSender<crate::server::command::Command>,
+        command: MpscSender<Command>,
         uri: Uri,
         socket_addr: SocketAddr,
         headers: HeaderMap,
@@ -155,7 +155,7 @@ impl WebHandler {
     ) -> IoResult<Response<StreamingBody>> {
         let (tx, rx) = oneshot_channel();
         command
-            .send(crate::server::command::Command::Request {
+            .send(Command::Request {
                 uri,
                 socket_addr,
                 headers,
@@ -173,7 +173,7 @@ impl WebHandler {
 
     async fn ws_dispatch(
         rt: Weak<Runtime>,
-        command: MpscSender<crate::server::command::Command>,
+        command: MpscSender<Command>,
         socket_addr: SocketAddr,
         req: Request<Incoming>,
         open_tx: OneshotSender<HeaderMap>,
@@ -183,7 +183,7 @@ impl WebHandler {
 
         let headers = req.headers().clone();
         if let Err(e) = command
-            .send(crate::server::command::Command::WsOpen {
+            .send(Command::WsOpen {
                 uri: uri.to_owned(),
                 socket_addr,
                 headers: headers.clone(),
@@ -212,7 +212,7 @@ impl WebHandler {
         }
 
         // Guard ensures cleanup on task abort
-        let _guard = crate::server::conn::WsConnGuard {
+        let _guard = WsConnGuard {
             uri: uri.clone(),
             socket_addr,
             headers: headers.clone(),
@@ -231,7 +231,7 @@ impl WebHandler {
                 Either::Left((Some(Ok(msg)), _)) => {
                     let (ret_tx, ret_rx) = oneshot_channel();
                     if let Err(e) = command
-                        .send(crate::server::command::Command::Transfer {
+                        .send(Command::Transfer {
                             socket_addr,
                             uri: uri.clone(),
                             headers: headers.clone(),

@@ -1,6 +1,6 @@
 [package]
 name = "edgy-s"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2024"
 authors = ["SmileSky <mzdk100@foxmail.com>"]
 license = "Apache-2.0"
@@ -11,11 +11,23 @@ keywords = ["websocket", "rpc", "microservice", "bidirectional", "async"]
 categories = ["network-programming", "web-programming::websocket", "asynchronous"]
 
 [[example]]
+name = "crates_io_search"
+required-features = ["client"]
+
+[[example]]
 name = "client"
 required-features = ["client"]
 
 [[example]]
 name = "server"
+required-features = ["server"]
+
+[[example]]
+name = "state_client"
+required-features = ["client"]
+
+[[example]]
+name = "state_server"
 required-features = ["server"]
 
 [features]
@@ -35,6 +47,7 @@ client = [
     "hyper-util/tokio",
     "hyper-util/client-legacy",
     "hyper-util/http1",
+    "hyper-tls",
     "percent-encoding/default",
     "postcard/alloc",
     "serde/default",
@@ -69,7 +82,7 @@ version = "0.1.44"
 optional = true
 
 [dependencies.tokio]
-version = "1.50.0"
+version = "1.51.0"
 optional = true
 
 [dependencies.futures-util]
@@ -85,7 +98,7 @@ version = "0.1.20"
 optional = true
 
 [dependencies.hyper]
-version = "1.8.1"
+version = "1.9.0"
 optional = true
 
 [dependencies.tokio-tungstenite]
@@ -100,8 +113,12 @@ optional = true
 version = "1.1.3"
 optional = true
 
+[dependencies.hyper-tls]
+version = "0.6.0"
+optional = true
+
 [dev-dependencies]
 anyhow = "1.0.102"
 async-stream = "0.3.6"
-tokio = {version = "1.50.0", features = ["macros", "rt-multi-thread"]}
+tokio = {version = "1.51.0", features = ["macros", "rt-multi-thread", "time"]}
 tracing-subscriber = "0.3.23"

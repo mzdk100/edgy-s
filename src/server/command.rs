@@ -2,6 +2,7 @@ use {
     super::{super::types::ReqId, StreamingBody},
     hyper::{HeaderMap, Uri},
     std::{io::Result as IoResult, net::SocketAddr},
+    tokio::sync::watch::Sender as WatchSender,
     tokio::{
         sync::{mpsc::Sender as MpscSender, oneshot::Sender as OneshotSender},
         task::JoinHandle,
@@ -21,8 +22,14 @@ pub enum Command {
             OneshotSender<Option<Message>>,
         )>,
         opt_return: OneshotSender<IoResult<()>>,
-        open: MpscSender<(crate::server::conn::HttpAccessor, OneshotSender<()>)>,
-        close: MpscSender<crate::server::conn::WsAccessor>,
+        open: MpscSender<(
+            Uri,
+            SocketAddr,
+            HeaderMap,
+            WatchSender<HeaderMap>,
+            OneshotSender<()>,
+        )>,
+        close: MpscSender<(Uri, SocketAddr, HeaderMap)>,
     },
 
     RemoveWsRoute {

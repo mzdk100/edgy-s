@@ -1,10 +1,13 @@
 use {
     super::{
-        super::types::{BaseBinding, Binding},
+        super::types::{BaseBinding, Binding, State},
         Accessor, Command, EdgyService, HttpConn, HttpServerRouter, IoError, IoResult,
         MpscReceiver, OneshotSender, WsConn, WsRouter,
     },
+    hyper::{HeaderMap, Uri},
     std::{
+        marker::PhantomData,
+        net::SocketAddr,
         ops::Deref,
         pin::Pin,
         sync::{Arc, Weak},
@@ -12,7 +15,7 @@ use {
     tokio::{
         runtime::Runtime,
         select,
-        sync::{Mutex, mpsc::WeakSender},
+        sync::{Mutex, mpsc::WeakSender, watch::Sender as WatchSender},
     },
     tracing::error,
 };
@@ -29,17 +32,25 @@ pub struct WsBinding<O, C> {
 }
 
 impl<O, C> WsBinding<O, C> {
-    pub(super) fn new<P>(
+    pub(super) fn new<P, S>(
         path: P,
         command: WeakSender<Command>,
         rt: Weak<Runtime>,
-        open_rx: MpscReceiver<(Accessor<O>, OneshotSender<()>)>,
-        close_rx: MpscReceiver<Accessor<C>>,
+        open_rx: MpscReceiver<(
+            Uri,
+            SocketAddr,
+            HeaderMap,
+            WatchSender<HeaderMap>,
+            OneshotSender<()>,
+        )>,
+        close_rx: MpscReceiver<(Uri, SocketAddr, HeaderMap)>,
+        state: State<S>,
     ) -> IoResult<Self>
     where
-        O: Send + 'static,
-        C: Send + 'static,
+        O: From<(Uri, SocketAddr, HeaderMap, State<S>, WatchSender<HeaderMap>)> + Send + 'static,
+        C: From<(Uri, SocketAddr, HeaderMap, State<S>)> + Send + 'static,
         P: AsRef<str>,
+        S: Send + Sync + 'static,
     {
         let rt = rt
             .upgrade()
@@ -59,9 +70,9 @@ impl<O, C> WsBinding<O, C> {
                 select! {
                     result = open_rx.recv() => {
                         match result {
-                            Some((accessor, ret)) => {
+                            Some((uri, addr, request_headers, response_headers, ret)) => {
                                 let lock = open_close_clone.lock().await;
-                                lock.0(accessor).await;
+                                lock.0(O::from((uri, addr, request_headers, state.clone(), response_headers,)).into()).await;
                                 drop(lock);
                                 if let Err(e) = ret.send(()) {
                                     error!(?e, "Failed to send open ret signal.");
@@ -72,9 +83,9 @@ impl<O, C> WsBinding<O, C> {
                     }
                     result = close_rx.recv() => {
                         match result {
-                            Some(accessor) => {
+                            Some((uri, addr, headers,)) => {
                                 let lock = open_close_clone.lock().await;
-                                lock.1(accessor).await;
+                                lock.1(C::from((uri, addr, headers, state.clone())).into()).await;
                             }
                             None => break,
                         }
@@ -122,9 +133,12 @@ impl<O, C> WsBinding<O, C> {
     }
 }
 
-impl Binding for WsBinding<HttpConn, WsConn> {
+impl<S> Binding for WsBinding<HttpConn<S>, WsConn<S>>
+where
+    S: Send + Sync + 'static,
+{
     async fn unbind(self) -> IoResult<()> {
-        <EdgyService as WsRouter<WsConn>>::remove_route(self).await
+        <EdgyService<S> as WsRouter<WsConn<S>, S>>::remove_route(self).await
     }
 }
 
@@ -139,28 +153,33 @@ impl<O, C> Deref for WsBinding<O, C> {
 /// HTTP binding for server-side request handlers.
 ///
 /// Manages an HTTP route registration on the server side.
-pub struct HttpBinding {
+pub struct HttpBinding<S> {
     base: BaseBinding<Command>,
+    _s: PhantomData<S>,
 }
 
-impl HttpBinding {
+impl<S> HttpBinding<S> {
     pub(super) fn new<P>(path: P, command: WeakSender<Command>) -> Self
     where
         P: AsRef<str>,
     {
         Self {
             base: BaseBinding::new(path, command),
+            _s: Default::default(),
         }
     }
 }
 
-impl Binding for HttpBinding {
+impl<S> Binding for HttpBinding<S>
+where
+    S: Send + Sync + 'static,
+{
     async fn unbind(self) -> IoResult<()> {
-        <EdgyService as HttpServerRouter<HttpConn>>::remove_route(self).await
+        <EdgyService<S> as HttpServerRouter<HttpConn<S>, S>>::remove_route(self).await
     }
 }
 
-impl Deref for HttpBinding {
+impl<S> Deref for HttpBinding<S> {
     type Target = BaseBinding<Command>;
 
     fn deref(&self) -> &Self::Target {

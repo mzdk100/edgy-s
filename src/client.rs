@@ -7,7 +7,7 @@ mod request;
 
 use {
     super::{
-        types::{Accessor, HttpClientAsyncFn, HttpClientRouter, WsAsyncFn, WsRouter},
+        types::{Accessor, HttpClientAsyncFn, HttpClientRouter, State, WsAsyncFn, WsRouter},
         utils::build_uri,
     },
     binding::{HttpBinding, WsBinding},
@@ -20,6 +20,7 @@ use {
     serde::{Deserialize, Serialize},
     std::{
         collections::HashMap,
+        fmt::Debug,
         io::{Error as IoError, ErrorKind, Result as IoResult},
         sync::Arc,
         time::Duration,
@@ -27,6 +28,7 @@ use {
     tokio::{
         runtime::{Builder, Runtime},
         sync::{
+            RwLock,
             mpsc::{Receiver as MpscReceiver, Sender as MpscSender, channel as mpsc_channel},
             oneshot::{Sender as OneshotSender, channel as oneshot_channel},
         },
@@ -48,23 +50,24 @@ const DEFAULT_RETRY_INTERVAL_MS: u64 = 1000;
 /// Builder for creating `EdgyClient` with custom configuration.
 ///
 /// # Example
-/// ```no_run
-/// use edgy_s::EdgyClient;
+/// ```ignore
+/// use edgy_s::client::EdgyClient;
 ///
-/// let client = EdgyClient::builder("ws://localhost")
+/// let client = EdgyClient::builder("ws://localhost")?
 ///     .workers(2)
 ///     .max_retries(5)
 ///     .retry_interval_ms(500)
 ///     .build()?;
 /// ```
-pub struct EdgyClientBuilder {
+pub struct EdgyClientBuilder<S = ()> {
     base_url: Uri,
     num_workers: usize,
     max_retries: usize,
     retry_interval: Duration,
+    state: State<S>,
 }
 
-impl EdgyClientBuilder {
+impl<S: Send + Sync + 'static> EdgyClientBuilder<S> {
     /// Sets the number of worker threads for the async runtime.
     pub fn workers(mut self, num: usize) -> Self {
         self.num_workers = num;
@@ -90,13 +93,14 @@ impl EdgyClientBuilder {
     }
 
     /// Builds the `EdgyClient` with the configured settings.
-    pub fn build(self) -> IoResult<EdgyClient> {
+    pub fn build(self) -> IoResult<EdgyClient<S>> {
         let rt = Builder::new_multi_thread()
             .worker_threads(self.num_workers)
             .enable_all()
             .build()?;
         let (tx, rx) = mpsc_channel(2);
-        let task = rt.spawn(EdgyClient::worker(rx));
+        let state = self.state.clone();
+        let task = rt.spawn(EdgyClient::<S>::worker(rx));
 
         Ok(EdgyClient {
             base_url: self.base_url,
@@ -105,6 +109,7 @@ impl EdgyClientBuilder {
             task: Some(task),
             max_retries: self.max_retries,
             retry_interval: self.retry_interval,
+            state,
         })
     }
 }
@@ -114,35 +119,42 @@ impl EdgyClientBuilder {
 /// The client provides both HTTP request routing and WebSocket connection management
 /// with automatic reconnection support.
 ///
+/// # Type Parameters
+/// - `S`: Shared state type (defaults to `()`)
+///
 /// # Example
-/// ```no_run
-/// use edgy_s::EdgyClient;
+/// ```ignore
+/// use edgy_s::client::EdgyClient;
 ///
 /// #[tokio::main]
 /// async fn main() -> std::io::Result<()> {
-///     let client = EdgyClient::builder("ws://localhost:8080")
+///     let client = EdgyClient::builder("ws://localhost:8080")?
 ///         .workers(2)
 ///         .max_retries(5)
 ///         .build()?;
-///     
+///
 ///     client.run().await
 /// }
 /// ```
-pub struct EdgyClient {
+pub struct EdgyClient<S = ()> {
     base_url: Uri,
     rt: Arc<Runtime>,
     command: MpscSender<Command>,
     task: Option<JoinHandle<IoResult<()>>>,
     max_retries: usize,
     retry_interval: Duration,
+    state: State<S>,
 }
 
-impl WsRouter<ResponseConn> for EdgyClient {
-    type Binding = WsBinding<RequestConn, ResponseConn>;
+impl<S> WsRouter<ResponseConn<S>, S> for EdgyClient<S>
+where
+    S: Debug + Send + Sync + 'static,
+{
+    type Binding = WsBinding<RequestConn<S>, ResponseConn<S>>;
 
     async fn add_route<F, P, Args, Ret>(&self, path: P, handler: F) -> IoResult<Self::Binding>
     where
-        F: WsAsyncFn<Args, Ret, ResponseConn>,
+        F: WsAsyncFn<Args, Ret, ResponseConn<S>, S>,
         Args: for<'a> Deserialize<'a> + Serialize + 'static,
         Ret: for<'a> Deserialize<'a> + Serialize + 'static,
         P: AsRef<str>,
@@ -169,6 +181,7 @@ impl WsRouter<ResponseConn> for EdgyClient {
         let (call_tx, call_rx) = mpsc_channel(2);
         let max_retries = self.max_retries;
         let retry_interval = self.retry_interval;
+        let state = self.state.clone();
         let task = self.rt.spawn(async move {
             ws_dispatch_with_auto_reconnection(
                 uri,
@@ -179,6 +192,7 @@ impl WsRouter<ResponseConn> for EdgyClient {
                 close_tx,
                 max_retries,
                 retry_interval,
+                state,
             )
             .await
         });
@@ -221,12 +235,12 @@ impl WsRouter<ResponseConn> for EdgyClient {
     }
 }
 
-impl HttpClientRouter<RequestConn> for EdgyClient {
+impl<S: Send + Sync + 'static> HttpClientRouter<RequestConn, S> for EdgyClient<S> {
     type Binding = HttpBinding;
 
     async fn add_route<F, P>(&self, path: P, _handler: F) -> IoResult<Self::Binding>
     where
-        F: HttpClientAsyncFn<RequestConn>,
+        F: HttpClientAsyncFn<RequestConn, S>,
         P: AsRef<str>,
     {
         let (request_tx, request_rx) = mpsc_channel(16);
@@ -248,6 +262,7 @@ impl HttpClientRouter<RequestConn> for EdgyClient {
                     base_url: self.base_url.clone(),
                     max_retries: self.max_retries,
                     retry_interval: self.retry_interval,
+                    state: self.state.clone(),
                 },
             );
         }
@@ -268,17 +283,18 @@ impl HttpClientRouter<RequestConn> for EdgyClient {
     }
 }
 
-impl EdgyClient {
-    /// Creates a new `EdgyClient` with default settings.
-    pub fn new<U>(base_url: U) -> IoResult<Self>
+impl<S> EdgyClient<S> {
+    /// Creates a new `EdgyClient` with the given shared state.
+    pub fn with_state<U>(base_url: U, state: S) -> IoResult<Self>
     where
         U: AsRef<str>,
+        S: Send + Sync + 'static,
     {
-        Self::builder(base_url)?.build()
+        Self::builder_with_state(base_url, state)?.build()
     }
 
-    /// Creates a builder for configuring the client.
-    pub fn builder<U>(base_url: U) -> IoResult<EdgyClientBuilder>
+    /// Creates a builder for configuring the client with the given state.
+    pub fn builder_with_state<U>(base_url: U, state: S) -> IoResult<EdgyClientBuilder<S>>
     where
         U: AsRef<str>,
     {
@@ -287,6 +303,7 @@ impl EdgyClient {
             num_workers: DEFAULT_NUM_WORKERS,
             max_retries: DEFAULT_MAX_RETRIES,
             retry_interval: Duration::from_millis(DEFAULT_RETRY_INTERVAL_MS),
+            state: RwLock::new(state).into(),
         })
     }
 
@@ -359,5 +376,37 @@ impl EdgyClient {
         if let Some(task) = self.task {
             task.abort();
         }
+    }
+
+    /// Returns a reference to the internal runtime.
+    ///
+    /// Use this to run async code on the client's runtime when you don't
+    /// want to create a separate tokio runtime.
+    pub fn rt(&self) -> &Arc<Runtime> {
+        &self.rt
+    }
+}
+
+impl EdgyClient<()> {
+    /// Creates a new `EdgyClient` with default settings and no state.
+    pub fn new<U>(base_url: U) -> IoResult<Self>
+    where
+        U: AsRef<str>,
+    {
+        Self::builder(base_url)?.build()
+    }
+
+    /// Creates a builder for configuring the client without state.
+    pub fn builder<U>(base_url: U) -> IoResult<EdgyClientBuilder<()>>
+    where
+        U: AsRef<str>,
+    {
+        Ok(EdgyClientBuilder {
+            base_url: base_url.as_ref().parse().map_err(IoError::other)?,
+            num_workers: DEFAULT_NUM_WORKERS,
+            max_retries: DEFAULT_MAX_RETRIES,
+            retry_interval: Duration::from_millis(DEFAULT_RETRY_INTERVAL_MS),
+            state: Default::default(),
+        })
     }
 }

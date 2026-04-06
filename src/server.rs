@@ -28,6 +28,7 @@ use {
         net::{TcpListener, ToSocketAddrs, lookup_host},
         runtime::{Builder, Runtime},
         sync::{
+            RwLock,
             mpsc::{Receiver as MpscReceiver, Sender as MpscSender, channel as mpsc_channel},
             oneshot::{Sender as OneshotSender, channel as oneshot_channel},
             watch::channel as watch_channel,
@@ -48,20 +49,21 @@ const DEFAULT_NUM_WORKERS: usize = 4;
 /// Builder for creating `EdgyService` with custom configuration.
 ///
 /// # Example
-/// ```no_run
-/// use edgy_s::EdgyService;
+/// ```ignore
+/// use edgy_s::server::EdgyService;
 ///
 /// let service = EdgyService::builder("0.0.0.0:80")
 ///     .workers(2)
 ///     .build()
 ///     .await?;
 /// ```
-pub struct EdgyServiceBuilder<Addr> {
+pub struct EdgyServiceBuilder<Addr, S = ()> {
     bind_addr: Addr,
     num_workers: usize,
+    state: Arc<RwLock<S>>,
 }
 
-impl<Addr> EdgyServiceBuilder<Addr>
+impl<Addr, S> EdgyServiceBuilder<Addr, S>
 where
     Addr: ToSocketAddrs,
 {
@@ -72,20 +74,24 @@ where
     }
 
     /// Builds the `EdgyService` with the configured settings.
-    pub async fn build(self) -> IoResult<EdgyService> {
+    pub async fn build(self) -> IoResult<EdgyService<S>>
+    where
+        S: Send + Sync + 'static,
+    {
         let rt = Builder::new_multi_thread()
             .worker_threads(self.num_workers)
             .enable_all()
             .build()?;
 
         let (command_tx, command_rx) = mpsc_channel(2);
-        let worker_task = rt.spawn(EdgyService::worker(command_rx));
+        let worker_task = rt.spawn(EdgyService::<S>::worker(command_rx));
 
         Ok(EdgyService {
             command: command_tx,
-            bind_addr: EdgyService::get_bind_addr(self.bind_addr).await?,
+            bind_addr: EdgyService::<S>::get_bind_addr(self.bind_addr).await?,
             rt: rt.into(),
             worker_task,
+            state: self.state,
         })
     }
 }
@@ -95,9 +101,12 @@ where
 /// The service provides both HTTP request routing and WebSocket connection management
 /// with support for bidirectional communication.
 ///
+/// # Type Parameters
+/// - `S`: Shared state type (defaults to `()`)
+///
 /// # Example
 /// ```no_run
-/// use edgy_s::EdgyService;
+/// use edgy_s::server::EdgyService;
 ///
 /// #[tokio::main]
 /// async fn main() -> std::io::Result<()> {
@@ -109,19 +118,23 @@ where
 ///     service.run().await
 /// }
 /// ```
-pub struct EdgyService {
+pub struct EdgyService<S = ()> {
     bind_addr: SocketAddr,
     rt: Arc<Runtime>,
     command: MpscSender<Command>,
     worker_task: JoinHandle<IoResult<()>>,
+    state: Arc<RwLock<S>>,
 }
 
-impl WsRouter<WsConn> for EdgyService {
-    type Binding = WsBinding<HttpConn, WsConn>;
+impl<S> WsRouter<WsConn<S>, S> for EdgyService<S>
+where
+    S: Send + Sync + 'static,
+{
+    type Binding = WsBinding<HttpConn<S>, WsConn<S>>;
 
     async fn add_route<F, P, Args, Ret>(&self, path: P, handler: F) -> IoResult<Self::Binding>
     where
-        F: WsAsyncFn<Args, Ret, WsConn>,
+        F: WsAsyncFn<Args, Ret, WsConn<S>, S>,
         Args: for<'a> Deserialize<'a> + Serialize,
         Ret: for<'a> Deserialize<'a> + Serialize + Send,
         P: AsRef<str>,
@@ -131,6 +144,7 @@ impl WsRouter<WsConn> for EdgyService {
         let (close_tx, close_rx) = mpsc_channel(2);
         let (ret_tx, ret_rx) = oneshot_channel();
         let command = self.command.clone();
+        let state = self.state.clone();
         command
             .send(Command::AddWsRoute {
                 path: path.as_ref().into(),
@@ -154,6 +168,7 @@ impl WsRouter<WsConn> for EdgyService {
 
         let path = path.as_ref().to_owned();
         let path2 = path.clone();
+        let state2 = state.clone();
         self.rt.spawn(async move {
             while let Some((uri, socket_addr, headers, msg, ret_tx)) = stream_rx.recv().await {
                 let packet = match Packet::<Args, Ret>::from_message(&msg) {
@@ -166,9 +181,11 @@ impl WsRouter<WsConn> for EdgyService {
 
                 match packet {
                     Packet::Call(id, args) => {
+                        let accessor =
+                            WsConn::from((uri, socket_addr, headers, state.clone())).into();
                         let ret = match Packet::<Args, Ret>::make_ret_message(
                             id,
-                            handler.call((uri, socket_addr, headers).into(), args).await,
+                            handler.call(accessor, args).await,
                         ) {
                             Ok(r) => r,
                             Err(e) => {
@@ -208,6 +225,7 @@ impl WsRouter<WsConn> for EdgyService {
             Arc::downgrade(&self.rt),
             open_rx,
             close_rx,
+            state2,
         )
     }
 
@@ -225,22 +243,26 @@ impl WsRouter<WsConn> for EdgyService {
     }
 }
 
-impl HttpServerRouter<HttpConn> for EdgyService {
-    type Binding = HttpBinding;
+impl<S> HttpServerRouter<HttpConn<S>, S> for EdgyService<S>
+where
+    S: Send + Sync + 'static,
+{
+    type Binding = HttpBinding<S>;
 
     async fn add_route<F, P, Body, Ret>(&self, path: P, handler: F) -> IoResult<Self::Binding>
     where
-        F: HttpServerAsyncFn<Body, Ret, HttpConn>,
+        F: HttpServerAsyncFn<Body, Ret, HttpConn<S>>,
         Body: From<StreamingBody>,
         P: AsRef<str>,
         Ret: IntoStreamingBody,
     {
         let (req_tx, mut req_rx) =
             mpsc_channel::<(Uri, SocketAddr, HeaderMap, StreamingBody, OneshotSender<_>)>(2);
+        let state = self.state.clone();
         let task = self.rt.spawn(async move {
             while let Some((uri, addr, headers, body, ret_tx)) = req_rx.recv().await {
                 let (tx, rx) = watch_channel(Default::default());
-                let accessor = (uri, addr, headers, tx).into();
+                let accessor = HttpConn::from((uri, addr, headers, state.clone(), tx)).into();
                 let ret = handler.call(accessor, body.into()).await;
                 let response_headers = rx.borrow().clone();
                 if let Err(e) = ret_tx.send((response_headers, ret.into_streaming_body())) {
@@ -277,23 +299,27 @@ impl HttpServerRouter<HttpConn> for EdgyService {
     }
 }
 
-impl EdgyService {
-    /// Creates a new `EdgyService` with default settings.
-    pub async fn new<Addr>(bind_addr: Addr) -> IoResult<Self>
+impl<S> EdgyService<S> {
+    /// Creates a new `EdgyService` with the given shared state.
+    pub async fn with_state<Addr>(bind_addr: Addr, state: S) -> IoResult<Self>
     where
         Addr: ToSocketAddrs,
+        S: Send + Sync + 'static,
     {
-        Self::builder(bind_addr).build().await
+        Self::builder_with_state(bind_addr, state).build().await
     }
 
-    /// Creates a builder for configuring the service.
-    pub fn builder<Addr>(bind_addr: Addr) -> EdgyServiceBuilder<Addr>
+    /// Creates a builder for configuring the service with the given state.
+    pub fn builder_with_state<Addr>(bind_addr: Addr, state: S) -> EdgyServiceBuilder<Addr, S>
     where
         Addr: ToSocketAddrs,
     {
+        let state = RwLock::new(state);
+
         EdgyServiceBuilder {
             bind_addr,
             num_workers: DEFAULT_NUM_WORKERS,
+            state: state.into(),
         }
     }
 
@@ -302,7 +328,10 @@ impl EdgyService {
     /// This method blocks and continuously accepts new connections.
     /// Each connection is handled in a separate async task.
     /// The server runs until the internal worker task is finished or aborted.
-    pub async fn run(self) -> IoResult<()> {
+    pub async fn run(self) -> IoResult<()>
+    where
+        S: Send + Sync + 'static,
+    {
         let listener = TcpListener::bind(&self.bind_addr).await?;
         info!("WebSocket server listening on {}", self.bind_addr);
         while !self.worker_task.is_finished() {
@@ -436,22 +465,20 @@ impl EdgyService {
 
                 Command::WsOpen { uri, socket_addr, headers, res_tx: response_tx } => {
                     if let Some((_, open, _)) = ws_handlers.get(uri.path()) {
-                        let (tx, rx) = watch_channel(Default::default());
-                        let accessor: HttpConn = (uri, socket_addr, headers, tx).into();
+                        let (headers_tx, headers_rx) = watch_channel(Default::default());
                         let (ret_tx, ret_rx) = oneshot_channel();
-                        if let Err(e) = open.send((accessor.into(), ret_tx)).await {
+                        if let Err(e) = open.send((uri, socket_addr, headers, headers_tx, ret_tx)).await {
                             error!(?e, "Unable to open connection.");
                         } else if let Err(e) = ret_rx.await {
                             error!(?e, "Unable to send the response.");
-                        } else if let Err(e) = response_tx.send(rx.borrow().clone()) {
+                        } else if let Err(e) = response_tx.send(headers_rx.borrow().clone()) {
                             error!(?e, "Unable to open connection.");
                         }
                     };
                 }
 
                 Command::WsClose {uri, socket_addr, headers} => if let Some((_, _, close)) = ws_handlers.get(uri.path()) {
-                    let accessor: WsConn = (uri, socket_addr, headers).into();
-                    if let Err(e) = close.send(accessor.into()).await {
+                    if let Err(e) = close.send((uri, socket_addr, headers, )).await {
                         error!(?e, "Unable to close connection.");
                     }
                 }
@@ -476,6 +503,28 @@ impl EdgyService {
                 ErrorKind::NotFound,
                 "Unable to obtain host address.",
             ))
+        }
+    }
+}
+
+impl EdgyService<()> {
+    /// Creates a new `EdgyService` with default settings and no state.
+    pub async fn new<Addr>(bind_addr: Addr) -> IoResult<Self>
+    where
+        Addr: ToSocketAddrs,
+    {
+        Self::builder(bind_addr).build().await
+    }
+
+    /// Creates a builder for configuring the service without state.
+    pub fn builder<Addr>(bind_addr: Addr) -> EdgyServiceBuilder<Addr, ()>
+    where
+        Addr: ToSocketAddrs,
+    {
+        EdgyServiceBuilder {
+            bind_addr,
+            num_workers: DEFAULT_NUM_WORKERS,
+            state: Default::default(),
         }
     }
 }

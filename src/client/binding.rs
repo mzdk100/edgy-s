@@ -5,6 +5,7 @@ use {
         WsRouter,
     },
     std::{
+        fmt::Debug,
         ops::Deref,
         pin::Pin,
         sync::{Arc, Weak},
@@ -155,9 +156,12 @@ impl<Req, Res> WsBinding<Req, Res> {
     }
 }
 
-impl Binding for WsBinding<RequestConn, ResponseConn> {
+impl<S> Binding for WsBinding<RequestConn<S>, ResponseConn<S>>
+where
+    S: Debug + Send + Sync + 'static,
+{
     async fn unbind(self) -> IoResult<()> {
-        <EdgyClient as WsRouter<ResponseConn>>::remove_route(self).await
+        <EdgyClient<S> as WsRouter<ResponseConn<S>, S>>::remove_route(self).await
     }
 }
 
@@ -192,7 +196,7 @@ impl HttpBinding {
 impl Binding for HttpBinding {
     async fn unbind(self) -> IoResult<()> {
         self.task.abort();
-        <EdgyClient as HttpClientRouter<RequestConn>>::remove_route(self).await
+        <EdgyClient<()> as HttpClientRouter<RequestConn, ()>>::remove_route(self).await
     }
 }
 

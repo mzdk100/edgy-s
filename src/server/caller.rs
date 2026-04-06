@@ -24,29 +24,29 @@ pub(super) static BIND_SENDERS: LazyLock<Mutex<HashMap<String, WeakSender<Comman
 /// ```ignore
 /// let result: i32 = (1, 2).call_remotely(&ws_accessor).await?;
 /// ```
-pub trait WsCaller<Args, Ret> {
+pub trait WsCaller<Args, Ret, S = ()> {
     /// Calls a remote function on a specific client connection.
     ///
     /// The `target` specifies which client connection to send the request to.
     fn call_remotely<T>(self, target: T) -> impl Future<Output = IoResult<Ret>>
     where
-        T: AsRef<WsAccessor>;
+        T: AsRef<WsAccessor<S>>;
 }
 
-impl<Args, Ret> WsCaller<Args, Ret> for Args
+impl<Args, Ret, S> WsCaller<Args, Ret, S> for Args
 where
     Args: for<'a> Deserialize<'a> + Serialize,
     Ret: for<'a> Deserialize<'a> + Serialize,
 {
     async fn call_remotely<T>(self, target: T) -> IoResult<Ret>
     where
-        T: AsRef<WsAccessor>,
+        T: AsRef<WsAccessor<S>>,
     {
         static AUTO_ID: AtomicReqId = AtomicReqId::new(0);
 
         let path = target.as_ref().path();
         let socket_addr = target.as_ref().get_addr();
-        let Some(command) = BIND_SENDERS.lock().await.get(path).map(|i| i.clone()) else {
+        let Some(command) = BIND_SENDERS.lock().await.get(path).cloned() else {
             return Err(IoError::other(format!(
                 "The connection with the `{}` address cannot be sent to the `{}` path to call the remote function, because the function is not bound to the server.",
                 socket_addr, path,
@@ -67,7 +67,7 @@ where
                 path: path.to_owned(),
                 socket_addr,
                 id: req_id,
-                msg: crate::types::Packet::<Args, Ret>::make_call_message(req_id, self)?,
+                msg: Packet::<Args, Ret>::make_call_message(req_id, self)?,
                 ret_tx: tx,
             })
             .await

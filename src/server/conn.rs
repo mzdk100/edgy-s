@@ -1,5 +1,9 @@
 use {
-    super::{super::utils::url_decode, Accessor, Command},
+    super::{
+        super::types::{Ref, RefMut, State},
+        super::utils::url_decode,
+        Accessor, Command,
+    },
     hyper::{
         header::{HeaderMap, HeaderName, HeaderValue},
         http::Uri,
@@ -29,13 +33,14 @@ pub(super) static WS_CONNS: LazyLock<Mutex<HashMap<(String, SocketAddr), MpscSen
     LazyLock::new(Default::default);
 
 /// Base Connection Information Shared Between WebSocket and HTTP connections.
-pub struct BaseConn {
+pub struct BaseConn<S = ()> {
     uri: Uri,
     socket_addr: SocketAddr,
     headers: HeaderMap,
+    state: State<S>,
 }
 
-impl BaseConn {
+impl<S> BaseConn<S> {
     /// Returns the client's socket address.
     pub fn get_addr(&self) -> SocketAddr {
         self.socket_addr
@@ -153,19 +158,30 @@ impl BaseConn {
     pub fn get_headers(&self) -> &HeaderMap {
         &self.headers
     }
+
+    /// Returns a reference to the shared state.
+    pub async fn borrow(&self) -> Ref<'_, S> {
+        Ref::new(self.state.read().await)
+    }
+
+    /// Returns a clone of the state Arc.
+    pub async fn borrow_mut(&self) -> RefMut<'_, S> {
+        RefMut::new(self.state.write().await)
+    }
 }
 
-impl From<(Uri, SocketAddr, HeaderMap)> for BaseConn {
-    fn from((uri, socket_addr, headers): (Uri, SocketAddr, HeaderMap)) -> Self {
+impl<S> From<(Uri, SocketAddr, HeaderMap, State<S>)> for BaseConn<S> {
+    fn from((uri, socket_addr, headers, state): (Uri, SocketAddr, HeaderMap, State<S>)) -> Self {
         Self {
             uri,
             socket_addr,
             headers,
+            state,
         }
     }
 }
 
-impl Deref for BaseConn {
+impl<S> Deref for BaseConn<S> {
     type Target = Uri;
 
     fn deref(&self) -> &Self::Target {
@@ -176,9 +192,9 @@ impl Deref for BaseConn {
 /// Type alias for WebSocket connection accessor (server-side).
 ///
 /// Provides access to `WsConn` methods for WebSocket connections.
-pub type WsAccessor = Accessor<WsConn>;
+pub type WsAccessor<S = ()> = Accessor<WsConn<S>>;
 
-impl AsRef<WsAccessor> for WsAccessor {
+impl<S> AsRef<WsAccessor<S>> for WsAccessor<S> {
     fn as_ref(&self) -> &Self {
         self
     }
@@ -188,34 +204,42 @@ impl AsRef<WsAccessor> for WsAccessor {
 ///
 /// Provides access to connection information and allows
 /// querying other connections to the same path.
-pub struct WsConn {
-    inner: BaseConn,
+pub struct WsConn<S = ()> {
+    inner: BaseConn<S>,
 }
 
-impl WsConn {
+impl<S> WsConn<S> {
     /// Returns all other connections to the same path.
-    pub async fn get_other_conns(&self) -> impl Iterator<Item = WsAccessor> {
+    pub async fn get_other_conns(&self) -> impl Iterator<Item = WsAccessor<S>> {
         WS_CONNS
             .lock()
             .await
             .keys()
             .filter(|(path, addr)| path == self.uri.path() && addr != &self.socket_addr)
-            .map(|(_, addr)| WsConn::from((self.uri.clone(), *addr, self.headers.clone())).into())
+            .map(|(_, addr)| {
+                WsConn::from((
+                    self.uri.clone(),
+                    *addr,
+                    self.headers.clone(),
+                    self.inner.state.clone(),
+                ))
+                .into()
+            })
             .collect::<Vec<_>>()
             .into_iter()
     }
 }
 
-impl From<(Uri, SocketAddr, HeaderMap)> for WsConn {
-    fn from((uri, socket_addr, headers): (Uri, SocketAddr, HeaderMap)) -> Self {
+impl<S> From<(Uri, SocketAddr, HeaderMap, State<S>)> for WsConn<S> {
+    fn from((uri, socket_addr, headers, state): (Uri, SocketAddr, HeaderMap, State<S>)) -> Self {
         Self {
-            inner: BaseConn::from((uri, socket_addr, headers)),
+            inner: (uri, socket_addr, headers, state).into(),
         }
     }
 }
 
-impl Deref for WsConn {
-    type Target = BaseConn;
+impl<S> Deref for WsConn<S> {
+    type Target = BaseConn<S>;
 
     fn deref(&self) -> &Self::Target {
         &self.inner
@@ -269,9 +293,9 @@ impl Drop for WsConnGuard {
 /// Type alias for HTTP connection accessor (server-side).
 ///
 /// Provides access to `HttpConn` methods for HTTP requests.
-pub type HttpAccessor = Accessor<HttpConn>;
+pub type HttpAccessor<S = ()> = Accessor<HttpConn<S>>;
 
-impl AsRef<HttpAccessor> for HttpAccessor {
+impl<S> AsRef<HttpAccessor<S>> for HttpAccessor<S> {
     fn as_ref(&self) -> &Self {
         self
     }
@@ -280,12 +304,12 @@ impl AsRef<HttpAccessor> for HttpAccessor {
 /// HTTP connection wrapper with response header support (server-side).
 ///
 /// Allows setting response headers before the response is sent.
-pub struct HttpConn {
-    inner: BaseConn,
+pub struct HttpConn<S = ()> {
+    inner: BaseConn<S>,
     response_headers: WatchSender<HeaderMap>,
 }
 
-impl HttpConn {
+impl<S> HttpConn<S> {
     /// Sets a response header (overwrites existing).
     ///
     /// # Arguments
@@ -322,34 +346,35 @@ impl HttpConn {
     }
 }
 
-impl From<(Uri, SocketAddr, HeaderMap, WatchSender<HeaderMap>)> for HttpConn {
+impl<S> From<(Uri, SocketAddr, HeaderMap, State<S>, WatchSender<HeaderMap>)> for HttpConn<S> {
     fn from(
-        (uri, socket_addr, request_headers, response_headers): (
+        (uri, socket_addr, request_headers, state, response_headers): (
             Uri,
             SocketAddr,
             HeaderMap,
+            State<S>,
             WatchSender<HeaderMap>,
         ),
     ) -> Self {
         Self {
-            inner: (uri, socket_addr, request_headers).into(),
+            inner: (uri, socket_addr, request_headers, state).into(),
             response_headers,
         }
     }
 }
 
-impl From<(Uri, SocketAddr, HeaderMap)> for HttpConn {
-    fn from((uri, socket_addr, headers): (Uri, SocketAddr, HeaderMap)) -> Self {
+impl<S> From<(Uri, SocketAddr, HeaderMap, State<S>)> for HttpConn<S> {
+    fn from((uri, socket_addr, headers, state): (Uri, SocketAddr, HeaderMap, State<S>)) -> Self {
         let (tx, _) = watch_channel(Default::default());
         Self {
-            inner: (uri, socket_addr, headers).into(),
+            inner: (uri, socket_addr, headers, state).into(),
             response_headers: tx,
         }
     }
 }
 
-impl Deref for HttpConn {
-    type Target = BaseConn;
+impl<S> Deref for HttpConn<S> {
+    type Target = BaseConn<S>;
 
     fn deref(&self) -> &Self::Target {
         &self.inner
@@ -359,12 +384,15 @@ impl Deref for HttpConn {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
 
     fn create_base_conn(uri: &str) -> BaseConn {
         BaseConn::from((
             uri.parse().unwrap(),
             "127.0.0.1:8080".parse().unwrap(),
             HeaderMap::new(),
+            Arc::new(RwLock::new(())),
         ))
     }
 

@@ -15,12 +15,13 @@ A minimalist WebSocket/HTTP bidirectional RPC framework for building complex mic
 - **Feature Flags** - Include only what you need (client/server)
 - **Auto Reconnection** - WebSocket client with configurable retry logic
 - **Builder Pattern** - Flexible client/service configuration
+- **Shared State** - Built-in state management with `Arc<RwLock<S>>` for concurrent access
 
 ## Installation
 
 ```toml
 [dependencies]
-edgy-s = { version = "1.0", features = ["server", "client"] }
+edgy-s = { version = "1.1", features = ["server", "client"] }
 ```
 
 ## Quick Start
@@ -318,8 +319,105 @@ Choose the appropriate request ID width based on your concurrency needs:
 
 ```toml
 [dependencies]
-edgy-s = { version = "1.0", features = ["server", "client", "req_id_u32"] }
+edgy-s = { version = "1.1", features = ["server", "client", "req_id_u32"] }
 ```
+
+## Shared State Management
+
+`EdgyService` and `EdgyClient` support shared state for managing application data across connections.
+
+### Server with State
+
+```rust
+use edgy_s::{
+    Binding, WsAsyncFn,
+    server::{EdgyService, WsAccessor, HttpAccessor},
+};
+
+// Define your state type
+#[derive(Debug, Default)]
+struct AppState {
+    user_count: u32,
+    messages: Vec<String>,
+}
+
+#[tokio::main]
+async fn main() -> std::io::Result<()> {
+    // Create service with state
+    let service: EdgyService<AppState> = EdgyService::builder_with_state(
+        "0.0.0.0:8080",
+        AppState::default(),
+    )
+    .workers(4)
+    .build()
+    .await?;
+    
+    // In handlers, access state via accessor
+    // ...
+    
+    service.run().await
+}
+
+// Access state in WebSocket handler
+async fn my_handler(accessor: WsAccessor<AppState>, data: String) -> String {
+    // Read state
+    let state = accessor.borrow().await;
+    println!("User count: {}", state.user_count);
+    drop(state);
+    
+    // Mutate state
+    let mut state = accessor.borrow_mut().await;
+    state.messages.push(data);
+    format!("Message #{} received", state.messages.len())
+}
+
+// on_open receives HttpAccessor (before WebSocket upgrade)
+async fn on_open(accessor: HttpAccessor<AppState>) {
+    let mut state = accessor.borrow_mut().await;
+    state.user_count += 1;
+}
+```
+
+### Client with State
+
+```rust
+use edgy_s::{
+    Binding, WsAsyncFn,
+    client::{EdgyClient, WsAccessor},
+};
+
+#[derive(Debug, Default)]
+struct ClientState {
+    request_count: u32,
+}
+
+#[tokio::main]
+async fn main() -> std::io::Result<()> {
+    let client: EdgyClient<ClientState> = EdgyClient::builder_with_state(
+        "ws://localhost:8080",
+        ClientState::default(),
+    )?
+    .workers(2)
+    .build()?;
+    
+    // ...
+    
+    client.run().await
+}
+
+async fn handler(accessor: WsAccessor<ClientState>, msg: String) -> String {
+    let state = accessor.borrow().await;
+    println!("Requests sent: {}", state.request_count);
+    "ok".into()
+}
+```
+
+### State Access Methods
+
+| Method | Description |
+|--------|-------------|
+| `borrow().await` | Get read guard (`Ref<S>`) - multiple concurrent readers |
+| `borrow_mut().await` | Get write guard (`RefMut<S>`) - exclusive access |
 
 ## Feature Flags
 
