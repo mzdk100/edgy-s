@@ -1,7 +1,7 @@
 #[cfg(feature = "client")]
 use super::HttpClientAsyncFn;
 #[cfg(feature = "server")]
-use super::HttpServerAsyncFn;
+use super::{HttpServerAsyncFn, IntoStreamingBody, StreamingBody};
 use {
     super::WsAsyncFn,
     serde::{Deserialize, Serialize},
@@ -106,10 +106,10 @@ pub trait HttpServerRouter<Acc, S = ()> {
         handler: F,
     ) -> impl Future<Output = IoResult<Self::Binding>>
     where
-        F: HttpServerAsyncFn<Body, Ret, Acc>,
-        Body: From<crate::types::stream::StreamingBody>,
+        F: HttpServerAsyncFn<Body, Ret, Acc, S>,
+        Body: From<StreamingBody>,
         P: AsRef<str>,
-        Ret: crate::types::stream::IntoStreamingBody;
+        Ret: IntoStreamingBody;
 
     fn remove_route(binding: Self::Binding) -> impl Future<Output = IoResult<()>>;
 }

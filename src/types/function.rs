@@ -109,7 +109,7 @@ impl_ws_async_fn!(a: A, b: B, c: C, d: D, e: E, f: F, g: G, h: H, i: I, j: J, k:
 /// my_handler.bind_as_response(&service).await?;
 /// ```
 #[cfg(feature = "server")]
-pub trait HttpServerAsyncFn<Body, Ret, Acc>
+pub trait HttpServerAsyncFn<Body, Ret, Acc, S = ()>
 where
     Self: Copy + Send + 'static,
 {
@@ -119,7 +119,7 @@ where
         path: P,
     ) -> impl Future<Output = IoResult<R::Binding>>
     where
-        R: HttpServerRouter<Acc>,
+        R: HttpServerRouter<Acc, S>,
         P: AsRef<str> + Send + Sync + 'static,
         Body: From<StreamingBody>,
         Ret: IntoStreamingBody,
@@ -129,7 +129,7 @@ where
 
     fn bind_as_response<R>(self, router: &R) -> impl Future<Output = IoResult<R::Binding>>
     where
-        R: HttpServerRouter<Acc>,
+        R: HttpServerRouter<Acc, S>,
         Body: From<StreamingBody>,
         Ret: IntoStreamingBody,
     {

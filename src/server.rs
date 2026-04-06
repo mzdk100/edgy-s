@@ -251,7 +251,7 @@ where
 
     async fn add_route<F, P, Body, Ret>(&self, path: P, handler: F) -> IoResult<Self::Binding>
     where
-        F: HttpServerAsyncFn<Body, Ret, HttpConn<S>>,
+        F: HttpServerAsyncFn<Body, Ret, HttpConn<S>, S>,
         Body: From<StreamingBody>,
         P: AsRef<str>,
         Ret: IntoStreamingBody,

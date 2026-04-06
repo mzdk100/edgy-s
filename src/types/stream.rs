@@ -214,6 +214,18 @@ impl From<StreamingBody> for Vec<u8> {
     }
 }
 
+impl From<StreamingBody> for () {
+    fn from(_value: StreamingBody) -> Self {
+        ()
+    }
+}
+
+impl From<()> for StreamingBody {
+    fn from(_value: ()) -> Self {
+        StreamingBody::Null
+    }
+}
+
 impl<T> From<StreamingBody> for Pin<Box<dyn Stream<Item = IoResult<T>> + Send + Sync>>
 where
     T: FromBytes,
