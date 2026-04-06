@@ -140,7 +140,7 @@ where
 }
 
 #[cfg(feature = "server")]
-impl<Fun, Fut, Body, Ret, Acc> HttpServerAsyncFn<Body, Ret, Acc> for Fun
+impl<Fun, Fut, Body, Ret, Acc, S> HttpServerAsyncFn<Body, Ret, Acc, S> for Fun
 where
     Fut: Future<Output = Ret> + Send + 'static,
     Fun: for<'a> Fn(Accessor<Acc>, Body) -> Fut + Copy + Send + 'static,
