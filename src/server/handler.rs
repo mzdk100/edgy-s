@@ -133,6 +133,13 @@ impl HyperService<Request<Incoming>> for WebHandler {
     }
 }
 
+impl Drop for WebHandler {
+    fn drop(&mut self) {
+        // Cancel all pending HTTP handlers when connection is closed
+        self.cancel_token.cancel();
+    }
+}
+
 impl WebHandler {
     const UPGRADE_VALUE: &str = "Upgrade";
     const WEBSOCKET_VALUE: &str = "websocket";

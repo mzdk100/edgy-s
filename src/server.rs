@@ -13,13 +13,13 @@ use {
     caller::BIND_SENDERS,
     command::Command,
     conn::{HttpConn, WS_CONNS, WsConn},
+    futures_util::future::{AbortHandle, Abortable},
     handler::WebHandler,
     hyper::{header::HeaderMap, http::Uri, server::conn::http1::Builder as Http1Builder},
     hyper_util::rt::TokioIo,
     serde::{Deserialize, Serialize},
     std::{
         collections::HashMap,
-        future::Future,
         io::{Error as IoError, ErrorKind, Result as IoResult},
         net::SocketAddr,
         sync::Arc,
@@ -272,15 +272,26 @@ where
                 let (tx, rx) = watch_channel(Default::default());
                 let accessor = HttpConn::from((uri, addr, headers, state.clone(), tx)).into();
 
-                // Use select to cancel the handler when the connection is closed
+                // Create abortable future so we can cancel the handler
+                let (abort_handle, abort_registration) = AbortHandle::new_pair();
+                let abortable_future =
+                    Abortable::new(handler.call(accessor, body.into()), abort_registration);
+
                 let ret = select! {
                     biased;
                     _ = cancel_token.cancelled() => {
-                        // Connection was canceled, skip sending response
+                        // Connection was cancelled, abort the handler
+                        abort_handle.abort();
                         continue;
                     }
-                    result = handler.call(accessor, body.into()) => {
-                        result
+                    result = abortable_future => {
+                        match result {
+                            Ok(r) => r,
+                            Err(_) => {
+                                // Handler was aborted
+                                continue;
+                            }
+                        }
                     }
                 };
 

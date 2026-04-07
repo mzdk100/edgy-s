@@ -1,6 +1,6 @@
 [package]
 name = "edgy-s"
-version = "1.1.5"
+version = "1.1.6"
 edition = "2024"
 authors = ["SmileSky <mzdk100@foxmail.com>"]
 license = "Apache-2.0"
@@ -63,6 +63,7 @@ client = [
 ]
 server = [
     "futures-util/default",
+    "futures-util/async-await-macro",
     "hyper/http1",
     "hyper/server",
     "hyper-util/tokio",
