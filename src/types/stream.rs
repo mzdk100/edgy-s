@@ -303,3 +303,10 @@ impl From<Value> for StreamingBody {
         to_vec(&value).unwrap_or_default().into_streaming_body()
     }
 }
+
+#[cfg(feature = "serde_json")]
+impl From<StreamingBody> for Value {
+    fn from(value: StreamingBody) -> Self {
+        from_slice(&value.into_vec()).unwrap_or_default()
+    }
+}
