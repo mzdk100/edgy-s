@@ -32,6 +32,7 @@ use {
         WebSocketStream,
         tungstenite::{Message, handshake::derive_accept_key, protocol::Role},
     },
+    tokio_util::sync::CancellationToken,
     tracing::{error, info, warn},
 };
 
@@ -39,6 +40,7 @@ pub(super) struct WebHandler {
     socket_addr: SocketAddr,
     command: MpscSender<Command>,
     rt: Weak<Runtime>,
+    cancel_token: CancellationToken,
 }
 
 impl HyperService<Request<Incoming>> for WebHandler {
@@ -76,10 +78,11 @@ impl HyperService<Request<Incoming>> for WebHandler {
             let uri = req.uri().to_owned();
             let headers = req.headers().clone();
             let body = req.into_body().into_streaming_body();
+            let cancel_token = self.cancel_token.child_token();
 
             return Box::pin(async move {
                 Ok(
-                    Self::http_dispatch(command, uri, socket_addr, headers, body)
+                    Self::http_dispatch(command, uri, socket_addr, headers, body, cancel_token)
                         .await
                         .unwrap_or_else(|e| {
                             let mut res = Response::new(
@@ -143,6 +146,7 @@ impl WebHandler {
             socket_addr,
             command,
             rt,
+            cancel_token: CancellationToken::new(),
         }
     }
 
@@ -152,6 +156,7 @@ impl WebHandler {
         socket_addr: SocketAddr,
         headers: HeaderMap,
         body: StreamingBody,
+        cancel_token: CancellationToken,
     ) -> IoResult<Response<StreamingBody>> {
         let (tx, rx) = oneshot_channel();
         command
@@ -161,6 +166,7 @@ impl WebHandler {
                 headers,
                 body,
                 ret_tx: tx,
+                cancel_token,
             })
             .await
             .map_err(IoError::other)?;

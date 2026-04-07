@@ -1,6 +1,6 @@
 [package]
 name = "edgy-s"
-version = "1.1.4"
+version = "1.1.5"
 edition = "2024"
 authors = ["SmileSky <mzdk100@foxmail.com>"]
 license = "Apache-2.0"
@@ -74,6 +74,7 @@ server = [
     "tokio/rt",
     "tokio/rt-multi-thread",
     "tokio-tungstenite/default",
+    "tokio-util",
     "tracing/default",
 ]
 
@@ -109,6 +110,10 @@ optional = true
 
 [dependencies.tokio-tungstenite]
 version = "0.29.0"
+optional = true
+
+[dependencies.tokio-util]
+version = "0.7.18"
 optional = true
 
 [dependencies.percent-encoding]

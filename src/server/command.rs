@@ -8,6 +8,7 @@ use {
         task::JoinHandle,
     },
     tokio_tungstenite::tungstenite::Message,
+    tokio_util::sync::CancellationToken,
 };
 
 #[derive(Debug)]
@@ -45,6 +46,7 @@ pub enum Command {
             HeaderMap,
             StreamingBody,
             OneshotSender<(HeaderMap, StreamingBody)>,
+            CancellationToken,
         )>,
         opt_return: OneshotSender<IoResult<()>>,
         task: JoinHandle<()>,
@@ -84,6 +86,7 @@ pub enum Command {
         headers: HeaderMap,
         body: StreamingBody,
         ret_tx: OneshotSender<(HeaderMap, StreamingBody)>,
+        cancel_token: CancellationToken,
     },
 
     WsOpen {

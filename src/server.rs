@@ -27,6 +27,7 @@ use {
     tokio::{
         net::{TcpListener, ToSocketAddrs, lookup_host},
         runtime::{Builder, Runtime},
+        select,
         sync::{
             RwLock,
             mpsc::{Receiver as MpscReceiver, Sender as MpscSender, channel as mpsc_channel},
@@ -35,6 +36,7 @@ use {
         },
         task::JoinHandle,
     },
+    tokio_util::sync::CancellationToken,
     tracing::{error, info},
 };
 
@@ -256,14 +258,32 @@ where
         P: AsRef<str>,
         Ret: IntoStreamingBody,
     {
-        let (req_tx, mut req_rx) =
-            mpsc_channel::<(Uri, SocketAddr, HeaderMap, StreamingBody, OneshotSender<_>)>(2);
+        let (req_tx, mut req_rx) = mpsc_channel::<(
+            Uri,
+            SocketAddr,
+            HeaderMap,
+            StreamingBody,
+            OneshotSender<_>,
+            CancellationToken,
+        )>(2);
         let state = self.state.clone();
         let task = self.rt.spawn(async move {
-            while let Some((uri, addr, headers, body, ret_tx)) = req_rx.recv().await {
+            while let Some((uri, addr, headers, body, ret_tx, cancel_token)) = req_rx.recv().await {
                 let (tx, rx) = watch_channel(Default::default());
                 let accessor = HttpConn::from((uri, addr, headers, state.clone(), tx)).into();
-                let ret = handler.call(accessor, body.into()).await;
+
+                // Use select to cancel the handler when the connection is closed
+                let ret = select! {
+                    biased;
+                    _ = cancel_token.cancelled() => {
+                        // Connection was canceled, skip sending response
+                        continue;
+                    }
+                    result = handler.call(accessor, body.into()) => {
+                        result
+                    }
+                };
+
                 let response_headers = rx.borrow().clone();
                 if let Err(e) = ret_tx.send((response_headers, ret.into_streaming_body())) {
                     error!(?e, "Unable to send data.");
@@ -483,9 +503,9 @@ impl<S> EdgyService<S> {
                     }
                 }
 
-                Command::Request {uri, socket_addr, headers, body, ret_tx} => {
+                Command::Request {uri, socket_addr, headers, body, ret_tx, cancel_token} => {
                     if let Some((handler, _)) = http_handlers.get(uri.path()) {
-                        handler.send((uri, socket_addr, headers, body, ret_tx)).await.map_or_else(|e| Err(IoError::other(e)), Ok)?;
+                        handler.send((uri, socket_addr, headers, body, ret_tx, cancel_token)).await.map_or_else(|e| Err(IoError::other(e)), Ok)?;
                     }
                 }
             }
