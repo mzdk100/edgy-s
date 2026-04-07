@@ -181,14 +181,17 @@ pub(super) async fn ws_dispatch_with_auto_reconnection<F, Args, Ret, S>(
             }
             Either::Left((Err(e), fut)) => {
                 warn!(?e, "Connection attempt failed, retrying...");
-                if attempt < max_retries - 1 {
-                    sleep(retry_interval).await;
-                }
+                sleep(retry_interval).await;
                 response_fut = fut;
                 continue;
             }
+            Either::Right((Err(e), _)) => {
+                error!(?e, "Error in WebSocket connection.");
+                sleep(retry_interval).await;
+                continue;
+            }
             _ => {
-                error!("Error in WebSocket connection.");
+                warn!("Connection finished before receiving response.");
                 break;
             }
         };
