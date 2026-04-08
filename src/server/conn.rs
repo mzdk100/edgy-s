@@ -1,7 +1,9 @@
 use {
     super::{
-        super::types::{Ref, RefMut, State},
-        super::utils::url_decode,
+        super::{
+            types::{Ref, RefMut, State, WsAsyncFn},
+            utils::{get_path, url_decode},
+        },
         Accessor, Command,
     },
     hyper::{
@@ -29,7 +31,14 @@ use {
     tracing::{error, warn},
 };
 
-pub(super) static WS_CONNS: LazyLock<Mutex<HashMap<(String, SocketAddr), MpscSender<Message>>>> =
+/// Connection information stored in the global connection map.
+pub(super) struct ConnInfo {
+    pub uri: Uri,
+    pub headers: HeaderMap,
+    pub sender: MpscSender<Message>,
+}
+
+pub(super) static WS_CONNS: LazyLock<Mutex<HashMap<(String, SocketAddr), ConnInfo>>> =
     LazyLock::new(Default::default);
 
 /// Base Connection Information Shared Between WebSocket and HTTP connections.
@@ -209,18 +218,61 @@ pub struct WsConn<S = ()> {
 }
 
 impl<S> WsConn<S> {
+    /// Finds a connection to a specific path that matches the given predicate.
+    ///
+    /// # Arguments
+    /// * `target` - A WebSocket handler function whose path will be searched
+    /// * `predicated` - A closure that filters connections
+    ///
+    /// # Returns
+    /// The first connection matching the path and predicate, or `None` if not found
+    pub async fn find_conn<F, Args, Ret, Acc, P>(
+        &self,
+        _target: F,
+        mut predicated: P,
+    ) -> Option<WsAccessor<S>>
+    where
+        F: WsAsyncFn<Args, Ret, Acc, S>,
+        P: FnMut(&mut WsAccessor<S>) -> bool,
+    {
+        let target_path = get_path::<F>();
+        let conns = WS_CONNS.lock().await;
+
+        // Find a connection matching the target path
+        for ((path, addr), info) in conns.iter() {
+            if path == &target_path {
+                // Create a WsAccessor using the target connection's uri and headers
+                let accessor: WsAccessor<S> = WsConn::from((
+                    info.uri.clone(),
+                    *addr,
+                    info.headers.clone(),
+                    self.inner.state.clone(),
+                ))
+                .into();
+
+                // Check if it matches the predicate
+                let mut accessor = accessor;
+                if predicated(&mut accessor) {
+                    return Some(accessor);
+                }
+            }
+        }
+
+        None
+    }
+
     /// Returns all other connections to the same path.
     pub async fn get_other_conns(&self) -> impl Iterator<Item = WsAccessor<S>> {
         WS_CONNS
             .lock()
             .await
-            .keys()
-            .filter(|(path, addr)| path == self.uri.path() && addr != &self.socket_addr)
-            .map(|(_, addr)| {
+            .iter()
+            .filter(|((path, addr), _)| path == self.uri.path() && *addr != self.socket_addr)
+            .map(|((_, addr), info)| {
                 WsConn::from((
-                    self.uri.clone(),
+                    info.uri.clone(),
                     *addr,
-                    self.headers.clone(),
+                    info.headers.clone(),
                     self.inner.state.clone(),
                 ))
                 .into()

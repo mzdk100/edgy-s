@@ -1,5 +1,8 @@
 use {
-    super::{Command, IntoStreamingBody, StreamingBody, TokioIo, conn::WsConnGuard},
+    super::{
+        Command, IntoStreamingBody, StreamingBody, TokioIo,
+        conn::{ConnInfo, WS_CONNS, WsConnGuard},
+    },
     futures_util::{
         SinkExt, StreamExt,
         future::{Either, select},
@@ -215,10 +218,17 @@ impl WebHandler {
         };
         let (mut outgoing, mut incoming) = stream.split();
         let (tx, mut rx) = mpsc_channel(2);
-        if crate::server::conn::WS_CONNS
+        if WS_CONNS
             .lock()
             .await
-            .insert((uri.path().to_owned(), socket_addr), tx)
+            .insert(
+                (uri.path().to_owned(), socket_addr),
+                ConnInfo {
+                    uri: uri.clone(),
+                    headers: headers.clone(),
+                    sender: tx,
+                },
+            )
             .is_some()
         {
             warn!("Overwrite connection to {}", uri);

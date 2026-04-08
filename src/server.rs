@@ -471,7 +471,7 @@ impl<S> EdgyService<S> {
                     ret_tx,
                 } => {
                     if let Some(conn) = WS_CONNS.lock().await.get(&(path.clone(), socket_addr)) {
-                        if let Err(e) = conn.send(msg).await {
+                        if let Err(e) = conn.sender.send(msg).await {
                             error!(?e, "Unable to send message.");
                         }
                         pending_requests.insert((path.clone(), socket_addr, id), ret_tx);
