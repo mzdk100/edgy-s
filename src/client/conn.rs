@@ -181,7 +181,7 @@ impl<S>
     }
 }
 
-impl RequestConn {
+impl<S> RequestConn<S> {
     /// Sets a request header (overwrites existing).
     ///
     /// # Arguments
