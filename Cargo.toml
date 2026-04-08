@@ -1,6 +1,6 @@
 [package]
 name = "edgy-s"
-version = "1.2.0"
+version = "1.2.1"
 edition = "2024"
 authors = ["SmileSky <mzdk100@foxmail.com>"]
 license = "Apache-2.0"

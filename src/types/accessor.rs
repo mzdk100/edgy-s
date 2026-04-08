@@ -58,7 +58,7 @@ impl<'a, S> DerefMut for RefMut<'a, S> {
 }
 
 /// A wrapper type that provides accessor functionality for connection types.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Accessor<I> {
     inner: I,
 }
