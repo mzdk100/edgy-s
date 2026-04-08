@@ -17,7 +17,7 @@ use {
         net::SocketAddr,
         ops::Deref,
         str::FromStr,
-        sync::{LazyLock, Weak},
+        sync::{Arc, LazyLock, Weak},
     },
     tokio::{
         runtime::Runtime,
@@ -42,10 +42,11 @@ pub(super) static WS_CONNS: LazyLock<Mutex<HashMap<(String, SocketAddr), ConnInf
     LazyLock::new(Default::default);
 
 /// Base Connection Information Shared Between WebSocket and HTTP connections.
+#[derive(Clone, Debug)]
 pub struct BaseConn<S = ()> {
-    uri: Uri,
+    uri: Arc<Uri>,
     socket_addr: SocketAddr,
-    headers: HeaderMap,
+    headers: Arc<HeaderMap>,
     state: State<S>,
 }
 
@@ -182,9 +183,9 @@ impl<S> BaseConn<S> {
 impl<S> From<(Uri, SocketAddr, HeaderMap, State<S>)> for BaseConn<S> {
     fn from((uri, socket_addr, headers, state): (Uri, SocketAddr, HeaderMap, State<S>)) -> Self {
         Self {
-            uri,
+            uri: uri.into(),
             socket_addr,
-            headers,
+            headers: headers.into(),
             state,
         }
     }
@@ -213,6 +214,7 @@ impl<S> AsRef<WsAccessor<S>> for WsAccessor<S> {
 ///
 /// Provides access to connection information and allows
 /// querying other connections to the same path.
+#[derive(Clone, Debug)]
 pub struct WsConn<S = ()> {
     inner: BaseConn<S>,
 }
@@ -356,6 +358,7 @@ impl<S> AsRef<HttpAccessor<S>> for HttpAccessor<S> {
 /// HTTP connection wrapper with response header support (server-side).
 ///
 /// Allows setting response headers before the response is sent.
+#[derive(Clone, Debug)]
 pub struct HttpConn<S = ()> {
     inner: BaseConn<S>,
     response_headers: WatchSender<HeaderMap>,

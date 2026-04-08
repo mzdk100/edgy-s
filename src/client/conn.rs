@@ -7,7 +7,9 @@ use {
         header::{HeaderMap, HeaderName, HeaderValue},
         http::{StatusCode, Uri},
     },
-    std::{collections::HashMap, fmt::Debug, io::Error as IoError, ops::Deref, str::FromStr},
+    std::{
+        collections::HashMap, fmt::Debug, io::Error as IoError, ops::Deref, str::FromStr, sync::Arc,
+    },
     tokio::sync::watch::Sender as WatchSender,
     tracing::{error, info},
 };
@@ -46,10 +48,10 @@ where
 /// Base connection information for client-side connections.
 ///
 /// Provides access to the request URI via `Deref`.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct BaseConn<S = ()> {
     state: State<S>,
-    uri: Uri,
+    uri: Arc<Uri>,
 }
 
 impl<S> BaseConn<S> {
@@ -66,7 +68,10 @@ impl<S> BaseConn<S> {
 
 impl<S> From<(Uri, State<S>)> for BaseConn<S> {
     fn from((uri, state): (Uri, State<S>)) -> Self {
-        Self { uri, state }
+        Self {
+            uri: uri.into(),
+            state,
+        }
     }
 }
 
@@ -81,7 +86,7 @@ impl<S> Deref for BaseConn<S> {
 /// Response connection wrapper for client-side responses.
 ///
 /// Provides access to response status code and headers.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct ResponseConn<S = ()> {
     base: BaseConn<S>,
     status: StatusCode,
@@ -142,7 +147,7 @@ impl<S> From<(Uri, StatusCode, HeaderMap, State<S>)> for ResponseConn<S> {
 ///
 /// Allows setting request headers and query parameters before
 /// the request is sent to the server.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct RequestConn<S = ()> {
     base: BaseConn<S>,
     request_headers: WatchSender<HeaderMap>,
