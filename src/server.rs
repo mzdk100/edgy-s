@@ -1,15 +1,18 @@
 mod binding;
+mod builder;
 mod caller;
 mod command;
 mod conn;
 mod handler;
 
+use tokio::sync::RwLock;
 use {
     super::types::{
-        Accessor, HttpServerAsyncFn, HttpServerRouter, IntoStreamingBody, Packet, StreamingBody,
-        WsAsyncFn, WsRouter,
+        Accessor, HttpServerAsyncFn, HttpServerRouter, IntoStreamingBody, Packet, State,
+        StreamingBody, WsAsyncFn, WsRouter,
     },
     binding::{HttpBinding, WsBinding},
+    builder::EdgyServiceBuilder,
     caller::BIND_SENDERS,
     command::Command,
     conn::{HttpConn, WS_CONNS, WsConn},
@@ -22,14 +25,14 @@ use {
         collections::{HashMap, hash_map::Entry},
         io::{Error as IoError, ErrorKind, Result as IoResult},
         net::SocketAddr,
+        ops::Deref,
         sync::Arc,
     },
     tokio::{
         net::{TcpListener, ToSocketAddrs, lookup_host},
-        runtime::{Builder, Runtime},
+        runtime::Runtime,
         select,
         sync::{
-            RwLock,
             mpsc::{Receiver as MpscReceiver, Sender as MpscSender, channel as mpsc_channel},
             oneshot::{Sender as OneshotSender, channel as oneshot_channel},
             watch::channel as watch_channel,
@@ -44,59 +47,6 @@ pub use {
     caller::WsCaller,
     conn::{HttpAccessor, WsAccessor},
 };
-
-/// Default configuration values
-const DEFAULT_NUM_WORKERS: usize = 4;
-
-/// Builder for creating `EdgyService` with custom configuration.
-///
-/// # Example
-/// ```ignore
-/// use edgy_s::server::EdgyService;
-///
-/// let service = EdgyService::builder("0.0.0.0:80")
-///     .workers(2)
-///     .build()
-///     .await?;
-/// ```
-pub struct EdgyServiceBuilder<Addr, S = ()> {
-    bind_addr: Addr,
-    num_workers: usize,
-    state: Arc<RwLock<S>>,
-}
-
-impl<Addr, S> EdgyServiceBuilder<Addr, S>
-where
-    Addr: ToSocketAddrs,
-{
-    /// Sets the number of worker threads for the async runtime.
-    pub fn workers(mut self, num: usize) -> Self {
-        self.num_workers = num;
-        self
-    }
-
-    /// Builds the `EdgyService` with the configured settings.
-    pub async fn build(self) -> IoResult<EdgyService<S>>
-    where
-        S: Send + Sync + 'static,
-    {
-        let rt = Builder::new_multi_thread()
-            .worker_threads(self.num_workers)
-            .enable_all()
-            .build()?;
-
-        let (command_tx, command_rx) = mpsc_channel(2);
-        let worker_task = rt.spawn(EdgyService::<S>::worker(command_rx));
-
-        Ok(EdgyService {
-            command: command_tx,
-            bind_addr: EdgyService::<S>::get_bind_addr(self.bind_addr).await?,
-            rt: rt.into(),
-            worker_task,
-            state: self.state,
-        })
-    }
-}
 
 /// WebSocket/HTTP server for handling incoming connections and requests.
 ///
@@ -125,7 +75,7 @@ pub struct EdgyService<S = ()> {
     rt: Arc<Runtime>,
     command: MpscSender<Command>,
     worker_task: JoinHandle<IoResult<()>>,
-    state: Arc<RwLock<S>>,
+    state: State<S>,
 }
 
 impl<S> WsRouter<WsConn<S>, S> for EdgyService<S>
@@ -345,13 +295,7 @@ impl<S> EdgyService<S> {
     where
         Addr: ToSocketAddrs,
     {
-        let state = RwLock::new(state);
-
-        EdgyServiceBuilder {
-            bind_addr,
-            num_workers: DEFAULT_NUM_WORKERS,
-            state: state.into(),
-        }
+        EdgyServiceBuilder::new(bind_addr, state)
     }
 
     /// Runs the server, accepting incoming connections until aborted.
@@ -555,10 +499,14 @@ impl EdgyService<()> {
     where
         Addr: ToSocketAddrs,
     {
-        EdgyServiceBuilder {
-            bind_addr,
-            num_workers: DEFAULT_NUM_WORKERS,
-            state: Default::default(),
-        }
+        EdgyServiceBuilder::new(bind_addr, ())
+    }
+}
+
+impl<S> Deref for EdgyService<S> {
+    type Target = RwLock<S>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.state
     }
 }
