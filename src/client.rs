@@ -166,12 +166,15 @@ where
     }
 }
 
-impl<S: Send + Sync + 'static> HttpClientRouter<RequestConn, S> for EdgyClient<S> {
+impl<S> HttpClientRouter<RequestConn<S>, S> for EdgyClient<S>
+where
+    S: Send + Sync + 'static,
+{
     type Binding = HttpBinding;
 
     async fn add_route<F, P>(&self, path: P, _handler: F) -> IoResult<Self::Binding>
     where
-        F: HttpClientAsyncFn<RequestConn, S>,
+        F: HttpClientAsyncFn<RequestConn<S>, S>,
         P: AsRef<str>,
     {
         let (request_tx, request_rx) = mpsc_channel(16);
