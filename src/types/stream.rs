@@ -22,7 +22,9 @@ use {
 /// - `Bytes`: Fixed-size byte buffer
 /// - `Incoming`: Hyper's incoming body stream
 /// - `Stream`: Custom async stream
+#[derive(Default)]
 pub enum StreamingBody {
+    #[default]
     Null,
     Bytes {
         bytes: Option<Bytes>,
@@ -135,12 +137,6 @@ impl Body for StreamingBody {
     }
 }
 
-impl Default for StreamingBody {
-    fn default() -> Self {
-        Self::Null
-    }
-}
-
 // Concrete From implementations for common types
 /// Trait for types that can be converted into a `StreamingBody`.
 ///
@@ -218,9 +214,7 @@ impl From<StreamingBody> for Vec<u8> {
 }
 
 impl From<StreamingBody> for () {
-    fn from(_value: StreamingBody) -> Self {
-        ()
-    }
+    fn from(_value: StreamingBody) -> Self {}
 }
 
 impl From<()> for StreamingBody {

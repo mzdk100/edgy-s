@@ -19,7 +19,7 @@ use {
     request::HTTP_BINDING_SENDERS,
     serde::{Deserialize, Serialize},
     std::{
-        collections::HashMap,
+        collections::{HashMap, hash_map::Entry},
         fmt::Debug,
         io::{Error as IoError, ErrorKind, Result as IoResult},
         sync::Arc,
@@ -332,11 +332,14 @@ impl<S> EdgyClient<S> {
                     opt_return,
                 } => {
                     opt_return
-                        .send(if tasks.contains_key(&path) {
-                            Err(IoError::other(format!("Can't add route: {}", path)))
-                        } else {
-                            tasks.insert(path, (stream, task));
-                            Ok(())
+                        .send(match tasks.entry(path) {
+                            Entry::Occupied(e) => {
+                                Err(IoError::other(format!("Can't add route: {}", e.key())))
+                            }
+                            Entry::Vacant(e) => {
+                                e.insert((stream, task));
+                                Ok(())
+                            }
                         })
                         .map_or_else(|e| e.map_err(IoError::other), Ok)?;
                 }
@@ -344,7 +347,10 @@ impl<S> EdgyClient<S> {
                 Command::RemoveWsRoute { path, opt_return } => opt_return
                     .send(tasks.remove(&path).map_or(
                         Err(IoError::other(format!("Can't remove route: {}", path))),
-                        |(_, i)| Ok(i.abort()),
+                        |(_, i)| {
+                            i.abort();
+                            Ok(())
+                        },
                     ))
                     .map_or_else(|e| e, Ok)?,
 

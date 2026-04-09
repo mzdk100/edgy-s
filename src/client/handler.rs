@@ -101,10 +101,10 @@ where
                 }
 
                 Ok(Packet::Ret(id, _ret)) => {
-                    if let Some(tx) = pending_requests.remove(&id) {
-                        if let Err(e) = tx.send(msg) {
-                            error!(?e, "Can't send the return message.");
-                        }
+                    if let Some(tx) = pending_requests.remove(&id)
+                        && let Err(e) = tx.send(msg)
+                    {
+                        error!(?e, "Can't send the return message.");
                     }
                 }
                 Err(e) => error!(?e, "Unable to decode packet."),
@@ -126,6 +126,7 @@ where
 
 /// WebSocket dispatch with automatic reconnection.
 /// Manages open/close signals: sends open on first successful connection, close on final exit.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn ws_dispatch_with_auto_reconnection<F, Args, Ret, S>(
     uri: Uri,
     request_tx: OneshotSender<(RequestAccessor<S>, OneshotSender<()>)>,

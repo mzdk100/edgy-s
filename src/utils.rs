@@ -1,10 +1,14 @@
 use {
-    hyper::Uri,
+    hyper::{
+        Uri,
+        header::{HeaderName, HeaderValue},
+    },
     percent_encoding::{AsciiSet, CONTROLS, percent_decode_str, utf8_percent_encode},
     std::{
         any::type_name,
         collections::HashMap,
         io::{Error as IoError, Result as IoResult},
+        str::FromStr,
     },
 };
 
@@ -105,7 +109,7 @@ pub fn url_decode(encoded: &str) -> Result<String, String> {
 /// * `base_url` - The base URL to combine with the path
 /// * `path` - The path to append to the base URL
 /// * `force_scheme` - If provided, overrides the scheme from base_url.
-///                    Automatically adds 's' suffix for TLS (e.g., "http" → "https" if base_url uses TLS)
+///   Automatically adds 's' suffix for TLS (e.g., "http" → "https" if base_url uses TLS)
 pub fn build_uri<P>(base_url: &Uri, path: P, force_scheme: Option<&str>) -> IoResult<Uri>
 where
     P: AsRef<str>,
@@ -189,4 +193,10 @@ pub fn append_query_params(uri: &Uri, params: &HashMap<String, String>) -> Uri {
     );
 
     new_uri.parse().unwrap_or_else(|_| uri.clone())
+}
+
+pub fn parse_header(name: &str, value: &str) -> Result<(HeaderName, HeaderValue), IoError> {
+    let name = HeaderName::from_str(name).map_err(IoError::other)?;
+    let value = HeaderValue::from_str(value).map_err(IoError::other)?;
+    Ok((name, value))
 }

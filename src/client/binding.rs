@@ -20,6 +20,7 @@ use {
 };
 
 type Handler<T> = Box<dyn Fn(Accessor<T>) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send>;
+type RequestOpenClose<Req, Res> = Arc<Mutex<(Handler<Req>, Handler<Res>, Handler<Res>)>>;
 
 /// WebSocket binding for client-side connections.
 ///
@@ -27,7 +28,7 @@ type Handler<T> = Box<dyn Fn(Accessor<T>) -> Pin<Box<dyn Future<Output = ()> + S
 /// hooks for handling incoming requests, connection open, and close events.
 pub struct WsBinding<Req, Res> {
     base: BaseBinding<Command>,
-    request_open_close: Arc<Mutex<(Handler<Req>, Handler<Res>, Handler<Res>)>>,
+    request_open_close: RequestOpenClose<Req, Res>,
 }
 
 impl<Req, Res> WsBinding<Req, Res> {
@@ -47,7 +48,7 @@ impl<Req, Res> WsBinding<Req, Res> {
         let rt = rt
             .upgrade()
             .ok_or(IoError::other("Runtime already dropped."))?;
-        let request_open_close: Arc<Mutex<(Handler<Req>, Handler<Res>, Handler<Res>)>> =
+        let request_open_close: RequestOpenClose<Req, Res> =
             Arc::new(Mutex::new((
                 Box::new(|_| Box::pin(async {}) as _),
                 Box::new(|_| Box::pin(async {}) as _),

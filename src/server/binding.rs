@@ -21,6 +21,8 @@ use {
 };
 
 type Handler<T> = Box<dyn Fn(Accessor<T>) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send>;
+type OpenPayload = (Uri, SocketAddr, HeaderMap, WatchSender<HeaderMap>, OneshotSender<()>);
+type ClosePayload = (Uri, SocketAddr, HeaderMap);
 
 /// WebSocket binding for server-side connections.
 ///
@@ -36,14 +38,8 @@ impl<O, C> WsBinding<O, C> {
         path: P,
         command: WeakSender<Command>,
         rt: Weak<Runtime>,
-        open_rx: MpscReceiver<(
-            Uri,
-            SocketAddr,
-            HeaderMap,
-            WatchSender<HeaderMap>,
-            OneshotSender<()>,
-        )>,
-        close_rx: MpscReceiver<(Uri, SocketAddr, HeaderMap)>,
+        open_rx: MpscReceiver<OpenPayload>,
+        close_rx: MpscReceiver<ClosePayload>,
         state: State<S>,
     ) -> IoResult<Self>
     where

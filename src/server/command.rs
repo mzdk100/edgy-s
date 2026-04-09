@@ -11,26 +11,19 @@ use {
     tokio_util::sync::CancellationToken,
 };
 
+type WsStreamSender = MpscSender<(Uri, SocketAddr, HeaderMap, Message, OneshotSender<Option<Message>>)>;
+type OpenSender = MpscSender<(Uri, SocketAddr, HeaderMap, WatchSender<HeaderMap>, OneshotSender<()>)>;
+type CloseSender = MpscSender<(Uri, SocketAddr, HeaderMap)>;
+type HttpReqSender = MpscSender<(Uri, SocketAddr, HeaderMap, StreamingBody, OneshotSender<(HeaderMap, StreamingBody)>, CancellationToken)>;
+
 #[derive(Debug)]
 pub enum Command {
     AddWsRoute {
         path: String,
-        stream: MpscSender<(
-            Uri,
-            SocketAddr,
-            HeaderMap,
-            Message,
-            OneshotSender<Option<Message>>,
-        )>,
+        stream: WsStreamSender,
         opt_return: OneshotSender<IoResult<()>>,
-        open: MpscSender<(
-            Uri,
-            SocketAddr,
-            HeaderMap,
-            WatchSender<HeaderMap>,
-            OneshotSender<()>,
-        )>,
-        close: MpscSender<(Uri, SocketAddr, HeaderMap)>,
+        open: OpenSender,
+        close: CloseSender,
     },
 
     RemoveWsRoute {
@@ -40,14 +33,7 @@ pub enum Command {
 
     AddHttpRoute {
         path: String,
-        req_tx: MpscSender<(
-            Uri,
-            SocketAddr,
-            HeaderMap,
-            StreamingBody,
-            OneshotSender<(HeaderMap, StreamingBody)>,
-            CancellationToken,
-        )>,
+        req_tx: HttpReqSender,
         opt_return: OneshotSender<IoResult<()>>,
         task: JoinHandle<()>,
     },

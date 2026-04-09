@@ -1,15 +1,16 @@
 use {
     super::{
-        super::types::{Ref, RefMut, State},
+        super::{
+            types::{Ref, RefMut, State},
+            utils::parse_header,
+        },
         Accessor, OneshotSender,
     },
     hyper::{
-        header::{HeaderMap, HeaderName, HeaderValue},
+        header::HeaderMap,
         http::{StatusCode, Uri},
     },
-    std::{
-        collections::HashMap, fmt::Debug, io::Error as IoError, ops::Deref, str::FromStr, sync::Arc,
-    },
+    std::{collections::HashMap, fmt::Debug, io::Error as IoError, ops::Deref, sync::Arc},
     tokio::sync::watch::Sender as WatchSender,
     tracing::{error, info},
 };
@@ -48,10 +49,19 @@ where
 /// Base connection information for client-side connections.
 ///
 /// Provides access to the request URI via `Deref`.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct BaseConn<S = ()> {
     state: State<S>,
     uri: Arc<Uri>,
+}
+
+impl<S> Clone for BaseConn<S> {
+    fn clone(&self) -> Self {
+        Self {
+            state: self.state.clone(),
+            uri: self.uri.clone(),
+        }
+    }
 }
 
 impl<S> BaseConn<S> {
@@ -86,11 +96,21 @@ impl<S> Deref for BaseConn<S> {
 /// Response connection wrapper for client-side responses.
 ///
 /// Provides access to response status code and headers.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct ResponseConn<S = ()> {
     base: BaseConn<S>,
     status: StatusCode,
     response_headers: HeaderMap,
+}
+
+impl<S> Clone for ResponseConn<S> {
+    fn clone(&self) -> Self {
+        Self {
+            base: self.base.clone(),
+            status: self.status,
+            response_headers: self.response_headers.clone(),
+        }
+    }
 }
 
 impl<S> ResponseConn<S> {
@@ -147,11 +167,21 @@ impl<S> From<(Uri, StatusCode, HeaderMap, State<S>)> for ResponseConn<S> {
 ///
 /// Allows setting request headers and query parameters before
 /// the request is sent to the server.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct RequestConn<S = ()> {
     base: BaseConn<S>,
     request_headers: WatchSender<HeaderMap>,
     query_params: WatchSender<HashMap<String, String>>,
+}
+
+impl<S> Clone for RequestConn<S> {
+    fn clone(&self) -> Self {
+        Self {
+            base: self.base.clone(),
+            request_headers: self.request_headers.clone(),
+            query_params: self.query_params.clone(),
+        }
+    }
 }
 
 impl<S> Deref for RequestConn<S> {
@@ -193,12 +223,10 @@ impl<S> RequestConn<S> {
     /// * `name` - The header name
     /// * `value` - The header value
     pub fn set_header(&self, name: &str, value: &str) -> Result<bool, IoError> {
-        let name = HeaderName::from_str(name).map_err(IoError::other)?;
-        let value = HeaderValue::from_str(value).map_err(IoError::other)?;
-
+        let (name, value) = parse_header(name, value)?;
         Ok(self.request_headers.send_if_modified(|map| {
             if let Some(v) = map.get(&name)
-                && v == &value
+                && v == value
             {
                 false
             } else {
@@ -214,12 +242,11 @@ impl<S> RequestConn<S> {
     /// * `name` - The header name
     /// * `value` - The header value
     pub fn add_header(&self, name: &str, value: &str) -> Result<(), IoError> {
-        let name = HeaderName::from_str(name).map_err(IoError::other)?;
-        let value = HeaderValue::from_str(value).map_err(IoError::other)?;
-
-        Ok(self.request_headers.send_modify(|map| {
+        let (name, value) = parse_header(name, value)?;
+        self.request_headers.send_modify(|map| {
             map.append(name, value);
-        }))
+        });
+        Ok(())
     }
 
     /// Sets a query parameter (overwrites existing).

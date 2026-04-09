@@ -2,21 +2,17 @@ use {
     super::{
         super::{
             types::{Ref, RefMut, State, WsAsyncFn},
-            utils::{get_path, url_decode},
+            utils::{get_path, parse_header, url_decode},
         },
         Accessor, Command,
     },
-    hyper::{
-        header::{HeaderMap, HeaderName, HeaderValue},
-        http::Uri,
-    },
+    hyper::{header::HeaderMap, http::Uri},
     std::{
         collections::HashMap,
         io::Error as IoError,
         mem::take,
         net::SocketAddr,
         ops::Deref,
-        str::FromStr,
         sync::{Arc, LazyLock, Weak},
     },
     tokio::{
@@ -42,7 +38,7 @@ pub(super) static WS_CONNS: LazyLock<Mutex<HashMap<(String, SocketAddr), ConnInf
     LazyLock::new(Default::default);
 
 /// Base Connection Information Shared Between WebSocket and HTTP connections.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct BaseConn<S = ()> {
     uri: Arc<Uri>,
     socket_addr: SocketAddr,
@@ -180,6 +176,17 @@ impl<S> BaseConn<S> {
     }
 }
 
+impl<S> Clone for BaseConn<S> {
+    fn clone(&self) -> Self {
+        Self {
+            headers: self.headers.clone(),
+            uri: self.uri.clone(),
+            state: self.state.clone(),
+            socket_addr: self.socket_addr,
+        }
+    }
+}
+
 impl<S> From<(Uri, SocketAddr, HeaderMap, State<S>)> for BaseConn<S> {
     fn from((uri, socket_addr, headers, state): (Uri, SocketAddr, HeaderMap, State<S>)) -> Self {
         Self {
@@ -214,9 +221,17 @@ impl<S> AsRef<WsAccessor<S>> for WsAccessor<S> {
 ///
 /// Provides access to connection information and allows
 /// querying other connections to the same path.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct WsConn<S = ()> {
     inner: BaseConn<S>,
+}
+
+impl<S> Clone for WsConn<S> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+        }
+    }
 }
 
 impl<S> WsConn<S> {
@@ -358,10 +373,19 @@ impl<S> AsRef<HttpAccessor<S>> for HttpAccessor<S> {
 /// HTTP connection wrapper with response header support (server-side).
 ///
 /// Allows setting response headers before the response is sent.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct HttpConn<S = ()> {
     inner: BaseConn<S>,
     response_headers: WatchSender<HeaderMap>,
+}
+
+impl<S> Clone for HttpConn<S> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            response_headers: self.response_headers.clone(),
+        }
+    }
 }
 
 impl<S> HttpConn<S> {
@@ -371,12 +395,10 @@ impl<S> HttpConn<S> {
     /// * `name` - The header name
     /// * `value` - The header value
     pub fn set_header(&self, name: &str, value: &str) -> Result<bool, IoError> {
-        let name = HeaderName::from_str(name).map_err(IoError::other)?;
-        let value = HeaderValue::from_str(value).map_err(IoError::other)?;
-
+        let (name, value) = parse_header(name, value)?;
         Ok(self.response_headers.send_if_modified(|map| {
             if let Some(v) = map.get(&name)
-                && v == &value
+                && v == value
             {
                 false
             } else {
@@ -392,12 +414,11 @@ impl<S> HttpConn<S> {
     /// * `name` - The header name
     /// * `value` - The header value
     pub fn add_header(&self, name: &str, value: &str) -> Result<(), IoError> {
-        let name = HeaderName::from_str(name).map_err(IoError::other)?;
-        let value = HeaderValue::from_str(value).map_err(IoError::other)?;
-
-        Ok(self.response_headers.send_modify(|map| {
+        let (name, value) = parse_header(name, value)?;
+        self.response_headers.send_modify(|map| {
             map.append(name, value);
-        }))
+        });
+        Ok(())
     }
 }
 

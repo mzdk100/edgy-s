@@ -19,7 +19,7 @@ use {
     hyper_util::rt::TokioIo,
     serde::{Deserialize, Serialize},
     std::{
-        collections::HashMap,
+        collections::{HashMap, hash_map::Entry},
         io::{Error as IoError, ErrorKind, Result as IoResult},
         net::SocketAddr,
         sync::Arc,
@@ -195,7 +195,7 @@ where
                                 continue;
                             }
                         };
-                        if let Err(e) = ret_tx.send(Some(ret.into())) {
+                        if let Err(e) = ret_tx.send(Some(ret)) {
                             error!(?e, "Unable to send data.");
                         }
                     }
@@ -280,7 +280,7 @@ where
                 let ret = select! {
                     biased;
                     _ = cancel_token.cancelled() => {
-                        // Connection was cancelled, abort the handler
+                        // Connection was canceled, abort the handler
                         abort_handle.abort();
                         continue;
                     }
@@ -408,11 +408,14 @@ impl<S> EdgyService<S> {
                     close
                 } => {
                     opt_return
-                        .send(if ws_handlers.contains_key(&path) {
-                            Err(IoError::other(format!("Can't add route: {}", path)))
-                        } else {
-                            ws_handlers.insert(path, (stream, open, close));
-                            Ok(())
+                        .send(match ws_handlers.entry(path) {
+                            Entry::Occupied(e) => {
+                                Err(IoError::other(format!("Can't add route: {}", e.key())))
+                            }
+                            Entry::Vacant(e) => {
+                                e.insert((stream, open, close));
+                                Ok(())
+                            }
                         })
                         .map_or_else(|e| e.map_err(IoError::other), Ok)?;
                 }
@@ -433,11 +436,14 @@ impl<S> EdgyService<S> {
                     opt_return
                 } => {
                     opt_return
-                        .send(if http_handlers.contains_key(&path) {
-                            Err(IoError::other(format!("Can't add route: {}", path)))
-                        } else {
-                            http_handlers.insert(path, (req_tx, task));
-                            Ok(())
+                        .send(match http_handlers.entry(path) {
+                            Entry::Occupied(e) => {
+                                Err(IoError::other(format!("Can't add route: {}", e.key())))
+                            }
+                            Entry::Vacant(e) => {
+                                e.insert((req_tx, task));
+                                Ok(())
+                            }
                         })
                         .map_or_else(|e| e.map_err(IoError::other), Ok)?;
                 }
@@ -446,7 +452,7 @@ impl<S> EdgyService<S> {
                     opt_return
                         .send(http_handlers.remove(&path).map_or(
                             Err(IoError::other(format!("Can't remove route: {}", path))),
-                            |i| Ok(i.1.abort()),
+                            |i| { i.1.abort(); Ok(()) },
                         ))
                         .map_or_else(|e| e, Ok)?;
                 }
@@ -508,11 +514,10 @@ impl<S> EdgyService<S> {
                     };
                 }
 
-                Command::WsClose {uri, socket_addr, headers} => if let Some((_, _, close)) = ws_handlers.get(uri.path()) {
-                    if let Err(e) = close.send((uri, socket_addr, headers, )).await {
+                Command::WsClose {uri, socket_addr, headers} => if let Some((_, _, close)) = ws_handlers.get(uri.path())
+                    && let Err(e) = close.send((uri, socket_addr, headers, )).await {
                         error!(?e, "Unable to close connection.");
                     }
-                }
 
                 Command::Request {uri, socket_addr, headers, body, ret_tx, cancel_token} => {
                     if let Some((handler, _)) = http_handlers.get(uri.path()) {
@@ -525,16 +530,14 @@ impl<S> EdgyService<S> {
         Ok(())
     }
 
-    fn get_bind_addr<Addr>(bind_addr: Addr) -> impl Future<Output = IoResult<SocketAddr>>
+    async fn get_bind_addr<Addr>(bind_addr: Addr) -> IoResult<SocketAddr>
     where
         Addr: ToSocketAddrs,
     {
-        async {
-            lookup_host(bind_addr).await?.next().ok_or(IoError::new(
-                ErrorKind::NotFound,
-                "Unable to obtain host address.",
-            ))
-        }
+        lookup_host(bind_addr).await?.next().ok_or(IoError::new(
+            ErrorKind::NotFound,
+            "Unable to obtain host address.",
+        ))
     }
 }
 

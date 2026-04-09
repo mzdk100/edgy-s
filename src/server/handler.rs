@@ -62,7 +62,7 @@ impl HyperService<Request<Incoming>> for WebHandler {
                 .get(CONNECTION)
                 .and_then(|h| h.to_str().ok())
                 .map(|h| {
-                    h.split(|c| c == ' ' || c == ',')
+                    h.split([' ', ','])
                         .any(|p| p.eq_ignore_ascii_case(Self::UPGRADE_VALUE))
                 })
                 .unwrap_or(false)

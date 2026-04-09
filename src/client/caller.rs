@@ -54,7 +54,7 @@ where
             .lock()
             .await
             .get(&path)
-            .map(|i| i.clone())
+            .cloned()
         else {
             return Err(IoError::other(format!(
                 "The `{}` path used by the current `{}` function has not been bound to the client.",
