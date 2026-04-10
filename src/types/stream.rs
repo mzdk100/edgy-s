@@ -6,10 +6,12 @@ use {
         Error,
         body::{Body, Bytes, Frame, Incoming, SizeHint},
     },
+    parking_lot::RwLock,
     std::{
         fmt::Debug,
         io::{Error as IoError, Result as IoResult},
         pin::Pin,
+        sync::Arc,
         task::{Context, Poll, Waker},
     },
     tracing::error,
@@ -30,11 +32,26 @@ pub enum StreamingBody {
         bytes: Option<Bytes>,
     },
     Incoming {
-        incoming: Incoming,
+        incoming: Arc<RwLock<Incoming>>,
     },
     Stream {
-        stream: Pin<Box<dyn Stream<Item = Bytes> + Send + Sync>>,
+        stream: Arc<RwLock<Pin<Box<dyn Stream<Item = Bytes> + Send + Sync>>>>,
     },
+}
+
+impl Clone for StreamingBody {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Null => Self::Null,
+            Self::Bytes { bytes } => Self::Bytes {
+                bytes: bytes.clone(),
+            },
+            Self::Incoming { incoming } => Self::Incoming {
+                incoming: incoming.clone(),
+            },
+            Self::Stream { .. } => Self::Null,
+        }
+    }
 }
 
 impl Debug for StreamingBody {
@@ -59,9 +76,10 @@ impl StreamingBody {
                     ret.extend_from_slice(&data)
                 }
             }
-            StreamingBody::Incoming { mut incoming } => {
+            StreamingBody::Incoming { incoming } => {
+                let mut incoming = incoming.write();
                 while !incoming.is_end_stream() {
-                    match Pin::new(&mut incoming).poll_frame(&mut cx) {
+                    match Pin::new(&mut *incoming).poll_frame(&mut cx) {
                         Poll::Ready(Some(Ok(frame))) => match frame.into_data() {
                             Ok(data) => ret.extend_from_slice(&data),
                             Err(e) => error!(?e, "Failed to get data"),
@@ -78,11 +96,15 @@ impl StreamingBody {
                     }
                 }
             }
-            StreamingBody::Stream { mut stream } => loop {
+            StreamingBody::Stream { stream } => loop {
+                let mut stream = stream.write();
                 match stream.as_mut().poll_next(&mut cx) {
                     Poll::Ready(Some(data)) => ret.extend_from_slice(&data),
                     Poll::Ready(None) => break,
-                    Poll::Pending => continue,
+                    Poll::Pending => {
+                        cx.waker().wake_by_ref();
+                        continue;
+                    }
                 }
             },
         }
@@ -102,11 +124,14 @@ impl Body for StreamingBody {
         match self.get_mut() {
             Self::Null => Poll::Ready(None),
             Self::Bytes { bytes } => Poll::Ready(bytes.take().map(|b| Ok(Frame::data(b)))),
-            Self::Incoming { incoming } => Pin::new(incoming).poll_frame(cx),
-            Self::Stream { stream } => stream
-                .as_mut()
-                .poll_next(cx)
-                .map(|opt| opt.map(|i| Ok(Frame::data(i)))),
+            Self::Incoming { incoming } => Pin::new(&mut *incoming.write()).poll_frame(cx),
+            Self::Stream { stream } => {
+                let mut stream = stream.write();
+                stream
+                    .as_mut()
+                    .poll_next(cx)
+                    .map(|opt| opt.map(|i| Ok(Frame::data(i))))
+            }
         }
     }
 
@@ -114,7 +139,7 @@ impl Body for StreamingBody {
         match self {
             Self::Null => true,
             Self::Bytes { bytes } => bytes.is_none(),
-            Self::Incoming { incoming } => incoming.is_end_stream(),
+            Self::Incoming { incoming } => incoming.read().is_end_stream(),
             Self::Stream { .. } => false,
         }
     }
@@ -122,9 +147,9 @@ impl Body for StreamingBody {
     fn size_hint(&self) -> SizeHint {
         match self {
             Self::Bytes { bytes: Some(bytes) } => SizeHint::with_exact(bytes.len() as _),
-            Self::Incoming { incoming } => incoming.size_hint(),
+            Self::Incoming { incoming } => incoming.read().size_hint(),
             Self::Stream { stream } => {
-                let (min, max) = stream.size_hint();
+                let (min, max) = stream.read().size_hint();
                 let mut size = SizeHint::new();
                 size.set_lower(min as _);
                 if let Some(max) = max {
@@ -149,7 +174,9 @@ pub trait IntoStreamingBody {
 
 impl IntoStreamingBody for Incoming {
     fn into_streaming_body(self) -> StreamingBody {
-        StreamingBody::Incoming { incoming: self }
+        StreamingBody::Incoming {
+            incoming: RwLock::new(self).into(),
+        }
     }
 }
 
@@ -190,7 +217,7 @@ where
 {
     fn into_streaming_body(self) -> StreamingBody {
         StreamingBody::Stream {
-            stream: Box::pin(self.map(|i| i.into())),
+            stream: Arc::new(RwLock::new(Box::pin(self.map(|i| i.into())))),
         }
     }
 }

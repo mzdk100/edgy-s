@@ -114,7 +114,7 @@ where
 
 impl<ReqBody, ResBody, S> HttpPost<ReqBody, ResBody, ResponseConn<S>, S> for ReqBody
 where
-    ReqBody: IntoStreamingBody + Clone,
+    ReqBody: IntoStreamingBody,
     ResBody: From<StreamingBody>,
     S: Send + Sync + 'static,
 {
@@ -139,7 +139,7 @@ where
 
 impl<ReqBody, ResBody, S> HttpPut<ReqBody, ResBody, ResponseConn<S>, S> for ReqBody
 where
-    ReqBody: IntoStreamingBody + Clone,
+    ReqBody: IntoStreamingBody,
     ResBody: From<StreamingBody>,
     S: Send + Sync + 'static,
 {
@@ -164,7 +164,7 @@ where
 
 impl<ReqBody, ResBody, S> HttpPatch<ReqBody, ResBody, ResponseConn<S>, S> for ReqBody
 where
-    ReqBody: IntoStreamingBody + Clone,
+    ReqBody: IntoStreamingBody,
     ResBody: From<StreamingBody>,
     S: Send + Sync + 'static,
 {
@@ -183,7 +183,7 @@ async fn http_request<ReqBody, ResBody, F, S>(
     body: ReqBody,
 ) -> IoResult<(ResBody, Accessor<ResponseConn<S>>)>
 where
-    ReqBody: IntoStreamingBody + Clone,
+    ReqBody: IntoStreamingBody,
     ResBody: From<StreamingBody>,
     F: HttpClientAsyncFn<RequestConn<S>>,
     S: Send + Sync + 'static,
@@ -221,6 +221,9 @@ where
     let uri = append_query_params(&uri, &query_params);
     info!("Connect to {}", uri);
 
+    // Convert body to StreamingBody once before retry loop
+    let streaming_body = body.into_streaming_body();
+
     // Retry loop
     let mut last_error = None;
     for attempt in 0..config.max_retries {
@@ -232,7 +235,7 @@ where
                 uri.clone(),
                 method.clone(),
                 headers.clone(),
-                body.clone().into_streaming_body(),
+                streaming_body.clone(),
                 response_tx,
             ))
             .await
