@@ -242,7 +242,8 @@ let accessor: HttpAccessor = ().head(handler).await?;
 | `set_header(name, value)` | 设置响应头 |
 | `add_header(name, value)` | 追加响应头 |
 | `get_other_conns()` | 获取同路径的其他连接（仅 WsAccessor） |
-| `find_conn(target, predicate)` | 查找连接到特定路径且满足条件的连接（仅 WsAccessor） |
+| `find_conn(target, predicate)` | 查找连接到特定路径且满足条件的 WebSocket 连接（仅 WsAccessor） |
+| `find_ws_conn(target, predicate)` | 查找连接到特定路径且满足条件的 WebSocket 连接（仅 HttpAccessor） |
 
 #### 客户端 (WsAccessor / RequestAccessor)
 
@@ -419,6 +420,37 @@ async fn handler(accessor: WsAccessor<ClientState>, msg: String) -> String {
 |------|------|
 | `borrow().await` | 获取读锁守卫（`Ref<S>`）- 支持多个并发读取 |
 | `borrow_mut().await` | 获取写锁守卫（`RefMut<S>`）- 独占访问 |
+
+## 跨协议通信
+
+HTTP 处理器可以使用 `find_ws_conn()` 与 WebSocket 连接通信：
+
+```rust
+use edgy_s::{
+    Binding, HttpServerAsyncFn, WsAsyncFn,
+    server::{EdgyService, HttpAccessor, WsAccessor, WsCaller},
+};
+
+// 广播消息到 WebSocket 连接的 HTTP 端点
+async fn broadcast_to_websocket(accessor: HttpAccessor<()>, body: String) -> String {
+    // 查找 /chat 路径的 WebSocket 连接
+    if let Some(ws_conn) = accessor.find_ws_conn(chat_handler, |_acc| true).await {
+        // 向 WebSocket 客户端发送消息
+        let _: String = (body.clone(),)
+            .call_remotely(&ws_conn)
+            .await
+            .unwrap_or_else(|_| "发送失败".into());
+        format!("已广播: {}", body)
+    } else {
+        "未找到 WebSocket 连接".to_string()
+    }
+}
+
+async fn chat_handler(_accessor: WsAccessor<()>, msg: String) -> String {
+    println!("收到: {}", msg);
+    "ack".into()
+}
+```
 
 ## 特性开关
 

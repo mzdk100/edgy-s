@@ -37,6 +37,45 @@ pub(super) struct ConnInfo {
 pub(super) static WS_CONNS: LazyLock<Mutex<HashMap<(String, SocketAddr), ConnInfo>>> =
     LazyLock::new(Default::default);
 
+/// Helper function to find a WebSocket connection matching the given path and predicate.
+///
+/// # Arguments
+/// * `target` - The target handler function used to derive the path
+/// * `state` - The shared state reference
+/// * `predicated` - A closure that filters connections
+///
+/// # Returns
+/// The first connection matching the path and predicate, or `None` if not found
+async fn find_ws_connection<F, Args, Ret, Acc, S, P>(
+    _target: F,
+    state: State<S>,
+    mut predicated: P,
+) -> Option<WsAccessor<S>>
+where
+    F: WsAsyncFn<Args, Ret, Acc, S>,
+    P: FnMut(&mut WsAccessor<S>) -> bool,
+{
+    let target_path = get_path::<F>();
+    let conns = WS_CONNS.lock().await;
+
+    // Find a connection matching the target path
+    for ((path, addr), info) in conns.iter() {
+        if path == &target_path {
+            // Create a WsAccessor using the target connection's uri and headers
+            let accessor: WsAccessor<S> =
+                WsConn::from((info.uri.clone(), *addr, info.headers.clone(), state.clone())).into();
+
+            // Check if it matches the predicate
+            let mut accessor = accessor;
+            if predicated(&mut accessor) {
+                return Some(accessor);
+            }
+        }
+    }
+
+    None
+}
+
 /// Base Connection Information Shared Between WebSocket and HTTP connections.
 #[derive(Debug)]
 pub struct BaseConn<S = ()> {
@@ -245,37 +284,14 @@ impl<S> WsConn<S> {
     /// The first connection matching the path and predicate, or `None` if not found
     pub async fn find_conn<F, Args, Ret, Acc, P>(
         &self,
-        _target: F,
-        mut predicated: P,
+        target: F,
+        predicated: P,
     ) -> Option<WsAccessor<S>>
     where
         F: WsAsyncFn<Args, Ret, Acc, S>,
         P: FnMut(&mut WsAccessor<S>) -> bool,
     {
-        let target_path = get_path::<F>();
-        let conns = WS_CONNS.lock().await;
-
-        // Find a connection matching the target path
-        for ((path, addr), info) in conns.iter() {
-            if path == &target_path {
-                // Create a WsAccessor using the target connection's uri and headers
-                let accessor: WsAccessor<S> = WsConn::from((
-                    info.uri.clone(),
-                    *addr,
-                    info.headers.clone(),
-                    self.inner.state.clone(),
-                ))
-                .into();
-
-                // Check if it matches the predicate
-                let mut accessor = accessor;
-                if predicated(&mut accessor) {
-                    return Some(accessor);
-                }
-            }
-        }
-
-        None
+        find_ws_connection(target, self.inner.state.clone(), predicated).await
     }
 
     /// Returns all other connections to the same path.
@@ -419,6 +435,43 @@ impl<S> HttpConn<S> {
             map.append(name, value);
         });
         Ok(())
+    }
+
+    /// Finds a WebSocket connection to a specific path that matches the given predicate.
+    ///
+    /// This allows HTTP handlers to find and communicate with WebSocket connections.
+    ///
+    /// # Arguments
+    /// * `target` - A WebSocket handler function whose path will be searched
+    /// * `predicated` - A closure that filters connections
+    ///
+    /// # Returns
+    /// The first WebSocket connection matching the path and predicate, or `None` if not found
+    ///
+    /// # Example
+    /// ```ignore
+    /// async fn http_handler(accessor: HttpAccessor<AppState>, body: String) -> String {
+    ///     // Find a WebSocket connection to /chat
+    ///     if let Some(ws_conn) = accessor.find_ws_conn(chat_handler, |acc| true).await {
+    ///         // Send a message to the WebSocket connection
+    ///         let _: String = ("broadcast message".into())
+    ///             .call_remotely(&ws_conn)
+    ///             .await
+    ///             .unwrap();
+    ///     }
+    ///     "OK".into()
+    /// }
+    /// ```
+    pub async fn find_ws_conn<F, Args, Ret, Acc, P>(
+        &self,
+        target: F,
+        predicated: P,
+    ) -> Option<WsAccessor<S>>
+    where
+        F: WsAsyncFn<Args, Ret, Acc, S>,
+        P: FnMut(&mut WsAccessor<S>) -> bool,
+    {
+        find_ws_connection(target, self.inner.state.clone(), predicated).await
     }
 }
 

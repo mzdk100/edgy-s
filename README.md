@@ -242,7 +242,8 @@ let accessor: HttpAccessor = ().head(handler).await?;
 | `set_header(name, value)` | Set response header |
 | `add_header(name, value)` | Append response header |
 | `get_other_conns()` | Get other connections to same path (WsAccessor only) |
-| `find_conn(target, predicate)` | Find a connection to a specific path matching predicate (WsAccessor only) |
+| `find_conn(target, predicate)` | Find a WebSocket connection to a specific path matching predicate (WsAccessor only) |
+| `find_ws_conn(target, predicate)` | Find a WebSocket connection to a specific path matching predicate (HttpAccessor only) |
 
 #### Client-side (WsAccessor / RequestAccessor)
 
@@ -419,6 +420,37 @@ async fn handler(accessor: WsAccessor<ClientState>, msg: String) -> String {
 |--------|-------------|
 | `borrow().await` | Get read guard (`Ref<S>`) - multiple concurrent readers |
 | `borrow_mut().await` | Get write guard (`RefMut<S>`) - exclusive access |
+
+## Cross-Protocol Communication
+
+HTTP handlers can communicate with WebSocket connections using `find_ws_conn()`:
+
+```rust
+use edgy_s::{
+    Binding, HttpServerAsyncFn, WsAsyncFn,
+    server::{EdgyService, HttpAccessor, WsAccessor, WsCaller},
+};
+
+// HTTP endpoint that broadcasts to WebSocket connections
+async fn broadcast_to_websocket(accessor: HttpAccessor<()>, body: String) -> String {
+    // Find WebSocket connection to /chat path
+    if let Some(ws_conn) = accessor.find_ws_conn(chat_handler, |_acc| true).await {
+        // Send message to WebSocket client
+        let _: String = (body.clone(),)
+            .call_remotely(&ws_conn)
+            .await
+            .unwrap_or_else(|_| "Failed".into());
+        format!("Broadcasted: {}", body)
+    } else {
+        "No WebSocket connections".to_string()
+    }
+}
+
+async fn chat_handler(_accessor: WsAccessor<()>, msg: String) -> String {
+    println!("Received: {}", msg);
+    "ack".into()
+}
+```
 
 ## Feature Flags
 
