@@ -1,6 +1,6 @@
 use {
     super::{super::types::ReqId, StreamingBody},
-    hyper::{HeaderMap, Uri},
+    hyper::{HeaderMap, StatusCode, Uri},
     std::{io::Result as IoResult, net::SocketAddr},
     tokio::sync::watch::Sender as WatchSender,
     tokio::{
@@ -23,6 +23,7 @@ type OpenSender = MpscSender<(
     SocketAddr,
     HeaderMap,
     WatchSender<HeaderMap>,
+    WatchSender<StatusCode>,
     OneshotSender<()>,
 )>;
 type CloseSender = MpscSender<(Uri, SocketAddr, HeaderMap)>;
@@ -31,7 +32,7 @@ type HttpReqSender = MpscSender<(
     SocketAddr,
     HeaderMap,
     StreamingBody,
-    OneshotSender<(HeaderMap, StreamingBody)>,
+    OneshotSender<(HeaderMap, StatusCode, StreamingBody)>,
     CancellationToken,
 )>;
 
@@ -81,7 +82,7 @@ pub enum Command {
     CommitReturn {
         path: String,
         socket_addr: SocketAddr,
-        id: crate::types::ReqId,
+        id: ReqId,
         msg: Message,
     },
 
@@ -90,7 +91,7 @@ pub enum Command {
         socket_addr: SocketAddr,
         headers: HeaderMap,
         body: StreamingBody,
-        ret_tx: OneshotSender<(HeaderMap, StreamingBody)>,
+        ret_tx: OneshotSender<(HeaderMap, StatusCode, StreamingBody)>,
         cancel_token: CancellationToken,
     },
 
@@ -98,7 +99,7 @@ pub enum Command {
         uri: Uri,
         socket_addr: SocketAddr,
         headers: HeaderMap,
-        res_tx: OneshotSender<HeaderMap>,
+        res_tx: OneshotSender<(HeaderMap, StatusCode)>,
     },
 
     WsClose {

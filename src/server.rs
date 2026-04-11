@@ -5,7 +5,6 @@ mod command;
 mod conn;
 mod handler;
 
-use tokio::sync::RwLock;
 use {
     super::types::{
         Accessor, HttpServerAsyncFn, HttpServerRouter, IntoStreamingBody, Packet, State,
@@ -18,7 +17,9 @@ use {
     conn::{HttpConn, WS_CONNS, WsConn},
     futures_util::future::{AbortHandle, Abortable},
     handler::WebHandler,
-    hyper::{header::HeaderMap, http::Uri, server::conn::http1::Builder as Http1Builder},
+    hyper::{
+        StatusCode, header::HeaderMap, http::Uri, server::conn::http1::Builder as Http1Builder,
+    },
     hyper_util::rt::TokioIo,
     serde::{Deserialize, Serialize},
     std::{
@@ -33,6 +34,7 @@ use {
         runtime::Runtime,
         select,
         sync::{
+            RwLock,
             mpsc::{Receiver as MpscReceiver, Sender as MpscSender, channel as mpsc_channel},
             oneshot::{Sender as OneshotSender, channel as oneshot_channel},
             watch::channel as watch_channel,
@@ -66,7 +68,7 @@ pub use {
 ///         .workers(2)
 ///         .build()
 ///         .await?;
-///     
+///
 ///     service.run().await
 /// }
 /// ```
@@ -219,8 +221,11 @@ where
         let state = self.state.clone();
         let task = self.rt.spawn(async move {
             while let Some((uri, addr, headers, body, ret_tx, cancel_token)) = req_rx.recv().await {
-                let (tx, rx) = watch_channel(Default::default());
-                let accessor = HttpConn::from((uri, addr, headers, state.clone(), tx)).into();
+                let (headers_tx, headers_rx) = watch_channel(Default::default());
+                let (status_tx, status_rx) = watch_channel(StatusCode::OK);
+                let accessor =
+                    HttpConn::from((uri, addr, headers, state.clone(), headers_tx, status_tx))
+                        .into();
 
                 // Create abortable future so we can cancel the handler
                 let (abort_handle, abort_registration) = AbortHandle::new_pair();
@@ -245,8 +250,11 @@ where
                     }
                 };
 
-                let response_headers = rx.borrow().clone();
-                if let Err(e) = ret_tx.send((response_headers, ret.into_streaming_body())) {
+                let response_headers = headers_rx.borrow().clone();
+                let response_status = status_rx.borrow().clone();
+                if let Err(e) =
+                    ret_tx.send((response_headers, response_status, ret.into_streaming_body()))
+                {
                     error!(?e, "Unable to send data.");
                 }
             }
@@ -447,12 +455,13 @@ impl<S> EdgyService<S> {
                 Command::WsOpen { uri, socket_addr, headers, res_tx: response_tx } => {
                     if let Some((_, open, _)) = ws_handlers.get(uri.path()) {
                         let (headers_tx, headers_rx) = watch_channel(Default::default());
+                        let (status_tx, status_rx) = watch_channel(StatusCode::SWITCHING_PROTOCOLS);
                         let (ret_tx, ret_rx) = oneshot_channel();
-                        if let Err(e) = open.send((uri, socket_addr, headers, headers_tx, ret_tx)).await {
+                        if let Err(e) = open.send((uri, socket_addr, headers, headers_tx, status_tx, ret_tx)).await {
                             error!(?e, "Unable to open connection.");
                         } else if let Err(e) = ret_rx.await {
                             error!(?e, "Unable to send the response.");
-                        } else if let Err(e) = response_tx.send(headers_rx.borrow().clone()) {
+                        } else if let Err(e) = response_tx.send((headers_rx.borrow().clone(), status_rx.borrow().clone())) {
                             error!(?e, "Unable to open connection.");
                         }
                     };

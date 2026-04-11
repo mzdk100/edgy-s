@@ -113,8 +113,9 @@ impl HyperService<Request<Incoming>> for WebHandler {
 
         Box::pin(async move {
             let mut res = Response::new(Default::default());
-            *res.headers_mut() = rx.await.map_err(IoError::other)?;
-            *res.status_mut() = StatusCode::SWITCHING_PROTOCOLS;
+            let (headers, status) = rx.await.map_err(IoError::other)?;
+            *res.headers_mut() = headers;
+            *res.status_mut() = status;
             *res.version_mut() = ver;
             res.headers_mut()
                 .append(CONNECTION, HeaderValue::from_static(Self::UPGRADE_VALUE));
@@ -180,9 +181,11 @@ impl WebHandler {
             })
             .await
             .map_err(IoError::other)?;
-        let (response_headers, response_body) = rx.await.map_err(IoError::other)?;
+        let (response_headers, response_status, response_body) =
+            rx.await.map_err(IoError::other)?;
         let mut res = Response::new(response_body);
         *res.headers_mut() = response_headers;
+        *res.status_mut() = response_status;
 
         Ok(res)
     }
@@ -192,7 +195,7 @@ impl WebHandler {
         command: MpscSender<Command>,
         socket_addr: SocketAddr,
         req: Request<Incoming>,
-        open_tx: OneshotSender<HeaderMap>,
+        open_tx: OneshotSender<(HeaderMap, StatusCode)>,
     ) {
         let uri = req.uri().to_owned();
         info!("Establish bidi-communication {}", uri);

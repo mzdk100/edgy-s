@@ -4,7 +4,14 @@ mod packet;
 mod router;
 mod stream;
 
-pub use {accessor::*, function::*, packet::*, router::*, stream::*};
+pub use {
+    accessor::*,
+    function::*,
+    hyper::{StatusCode, Uri},
+    packet::*,
+    router::*,
+    stream::*,
+};
 
 /// Request ID type based on selected feature flag
 /// Priority: u64 > u32 > u16 > u8 (default)

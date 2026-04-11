@@ -242,6 +242,7 @@ let accessor: HttpAccessor = ().head(handler).await?;
 | `get_headers()` | 获取所有请求头 |
 | `set_header(name, value)` | 设置响应头 |
 | `add_header(name, value)` | 追加响应头 |
+| `set_status(status)` | 设置 HTTP 状态码（仅 HttpAccessor） |
 | `get_other_conns()` | 获取同路径的其他连接（仅 WsAccessor） |
 | `find_conn(target, predicate)` | 查找连接到特定路径且满足条件的 WebSocket 连接（仅 WsAccessor） |
 | `find_ws_conn(target, predicate)` | 查找连接到特定路径且满足条件的 WebSocket 连接（仅 HttpAccessor） |

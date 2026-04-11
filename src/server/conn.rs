@@ -6,7 +6,7 @@ use {
         },
         Accessor, Command,
     },
-    hyper::{header::HeaderMap, http::Uri},
+    hyper::{StatusCode, header::HeaderMap, http::Uri},
     std::{
         collections::HashMap,
         io::Error as IoError,
@@ -386,13 +386,14 @@ impl<S> AsRef<HttpAccessor<S>> for HttpAccessor<S> {
     }
 }
 
-/// HTTP connection wrapper with response header support (server-side).
+/// HTTP connection wrapper with response header and status code support (server-side).
 ///
-/// Allows setting response headers before the response is sent.
+/// Allows setting response headers and status code before the response is sent.
 #[derive(Debug)]
 pub struct HttpConn<S = ()> {
     inner: BaseConn<S>,
     response_headers: WatchSender<HeaderMap>,
+    response_status: WatchSender<StatusCode>,
 }
 
 impl<S> Clone for HttpConn<S> {
@@ -400,6 +401,7 @@ impl<S> Clone for HttpConn<S> {
         Self {
             inner: self.inner.clone(),
             response_headers: self.response_headers.clone(),
+            response_status: self.response_status.clone(),
         }
     }
 }
@@ -435,6 +437,22 @@ impl<S> HttpConn<S> {
             map.append(name, value);
         });
         Ok(())
+    }
+
+    /// Sets the HTTP status code for the response.
+    ///
+    /// # Arguments
+    /// * `status` - The HTTP status code (e.g., 200, 404, 500)
+    ///
+    /// # Example
+    /// ```ignore
+    /// async fn not_found_handler(accessor: HttpAccessor, _body: String) -> String {
+    ///     accessor.set_status(StatusCode::NOT_FOUND);
+    ///     "Not Found".into()
+    /// }
+    /// ```
+    pub fn set_status(&self, status: StatusCode) {
+        self.response_status.send_modify(|i| *i = status);
     }
 
     /// Finds a WebSocket connection to a specific path that matches the given predicate.
@@ -475,29 +493,42 @@ impl<S> HttpConn<S> {
     }
 }
 
-impl<S> From<(Uri, SocketAddr, HeaderMap, State<S>, WatchSender<HeaderMap>)> for HttpConn<S> {
+impl<S>
+    From<(
+        Uri,
+        SocketAddr,
+        HeaderMap,
+        State<S>,
+        WatchSender<HeaderMap>,
+        WatchSender<StatusCode>,
+    )> for HttpConn<S>
+{
     fn from(
-        (uri, socket_addr, request_headers, state, response_headers): (
+        (uri, socket_addr, request_headers, state, response_headers, response_status): (
             Uri,
             SocketAddr,
             HeaderMap,
             State<S>,
             WatchSender<HeaderMap>,
+            WatchSender<StatusCode>,
         ),
     ) -> Self {
         Self {
             inner: (uri, socket_addr, request_headers, state).into(),
             response_headers,
+            response_status,
         }
     }
 }
 
 impl<S> From<(Uri, SocketAddr, HeaderMap, State<S>)> for HttpConn<S> {
     fn from((uri, socket_addr, headers, state): (Uri, SocketAddr, HeaderMap, State<S>)) -> Self {
-        let (tx, _) = watch_channel(Default::default());
+        let (headers_tx, _) = watch_channel(Default::default());
+        let (status_tx, _) = watch_channel(StatusCode::OK);
         Self {
             inner: (uri, socket_addr, headers, state).into(),
-            response_headers: tx,
+            response_headers: headers_tx,
+            response_status: status_tx,
         }
     }
 }

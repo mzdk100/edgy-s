@@ -4,7 +4,7 @@ use {
         Accessor, Command, EdgyService, HttpConn, HttpServerRouter, IoError, IoResult,
         MpscReceiver, OneshotSender, WsConn, WsRouter,
     },
-    hyper::{HeaderMap, Uri},
+    hyper::{HeaderMap, StatusCode, Uri},
     std::{
         marker::PhantomData,
         net::SocketAddr,
@@ -26,6 +26,7 @@ type OpenPayload = (
     SocketAddr,
     HeaderMap,
     WatchSender<HeaderMap>,
+    WatchSender<StatusCode>,
     OneshotSender<()>,
 );
 type ClosePayload = (Uri, SocketAddr, HeaderMap);
@@ -49,7 +50,15 @@ impl<O, C> WsBinding<O, C> {
         state: State<S>,
     ) -> IoResult<Self>
     where
-        O: From<(Uri, SocketAddr, HeaderMap, State<S>, WatchSender<HeaderMap>)> + Send + 'static,
+        O: From<(
+                Uri,
+                SocketAddr,
+                HeaderMap,
+                State<S>,
+                WatchSender<HeaderMap>,
+                WatchSender<StatusCode>,
+            )> + Send
+            + 'static,
         C: From<(Uri, SocketAddr, HeaderMap, State<S>)> + Send + 'static,
         P: AsRef<str>,
         S: Send + Sync + 'static,
@@ -72,9 +81,9 @@ impl<O, C> WsBinding<O, C> {
                 select! {
                     result = open_rx.recv() => {
                         match result {
-                            Some((uri, addr, request_headers, response_headers, ret)) => {
+                            Some((uri, addr, request_headers, response_headers, response_status, ret)) => {
                                 let lock = open_close_clone.lock().await;
-                                lock.0(O::from((uri, addr, request_headers, state.clone(), response_headers,)).into()).await;
+                                lock.0(O::from((uri, addr, request_headers, state.clone(), response_headers, response_status)).into()).await;
                                 drop(lock);
                                 if let Err(e) = ret.send(()) {
                                     error!(?e, "Failed to send open ret signal.");

@@ -242,6 +242,7 @@ let accessor: HttpAccessor = ().head(handler).await?;
 | `get_headers()` | Get all request headers |
 | `set_header(name, value)` | Set response header |
 | `add_header(name, value)` | Append response header |
+| `set_status(status)` | Set HTTP status code (HttpAccessor only) |
 | `get_other_conns()` | Get other connections to same path (WsAccessor only) |
 | `find_conn(target, predicate)` | Find a WebSocket connection to a specific path matching predicate (WsAccessor only) |
 | `find_ws_conn(target, predicate)` | Find a WebSocket connection to a specific path matching predicate (HttpAccessor only) |
