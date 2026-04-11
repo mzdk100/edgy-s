@@ -251,7 +251,7 @@ where
                 };
 
                 let response_headers = headers_rx.borrow().clone();
-                let response_status = status_rx.borrow().clone();
+                let response_status = *status_rx.borrow();
                 if let Err(e) =
                     ret_tx.send((response_headers, response_status, ret.into_streaming_body()))
                 {
@@ -461,7 +461,7 @@ impl<S> EdgyService<S> {
                             error!(?e, "Unable to open connection.");
                         } else if let Err(e) = ret_rx.await {
                             error!(?e, "Unable to send the response.");
-                        } else if let Err(e) = response_tx.send((headers_rx.borrow().clone(), status_rx.borrow().clone())) {
+                        } else if let Err(e) = response_tx.send((headers_rx.borrow().clone(), *status_rx.borrow())) {
                             error!(?e, "Unable to open connection.");
                         }
                     };

@@ -49,7 +49,9 @@ impl Clone for StreamingBody {
             Self::Incoming { incoming } => Self::Incoming {
                 incoming: incoming.clone(),
             },
-            Self::Stream { .. } => Self::Null,
+            Self::Stream { stream } => Self::Stream {
+                stream: stream.clone(),
+            },
         }
     }
 }
