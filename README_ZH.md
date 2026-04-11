@@ -16,12 +16,13 @@
 - **自动重连** - WebSocket 客户端支持可配置的重试逻辑
 - **Builder 模式** - 灵活的客户端/服务端配置
 - **共享状态** - 内置基于 `Arc<RwLock<S>>` 的状态管理，支持并发访问
+- **多种序列化后端** - 支持 postcard（默认）、CBOR 和 JSON
 
 ## 安装
 
 ```toml
 [dependencies]
-edgy-s = { version = "1.1", features = ["server", "client"] }
+edgy-s = { version = "1.3", features = ["server", "client"] }
 ```
 
 ## 快速开始
@@ -321,8 +322,34 @@ binding
 
 ```toml
 [dependencies]
-edgy-s = { version = "1.1", features = ["server", "client", "req_id_u32"] }
+edgy-s = { version = "1.3", features = ["server", "client", "req_id_u32"] }
 ```
+
+## 序列化后端配置
+
+根据需求选择一种序列化后端。优先级为：`postcard` > `cbor4` > `serde_json`。
+
+| Feature | 库 | 格式 | 大小 | 适用场景 |
+|---------|---------|--------|------|----------|
+| `postcard`（默认） | postcard | 自定义二进制 | **最紧凑** | 最高效率、嵌入式系统 |
+| `cbor4` | cbor4ii | CBOR | 紧凑 | 支持更多数据类型、标准格式 |
+| `serde_json` | serde_json | JSON | 较大 | 人类可读、调试、Web API |
+
+```toml
+# 默认：postcard（最紧凑）
+[dependencies]
+edgy-s = { version = "1.3", features = ["server", "client"] }
+
+# 使用 CBOR 标准二进制格式
+[dependencies]
+edgy-s = { version = "1.3", features = ["server", "client", "cbor4"] }
+
+# 使用 JSON 人类可读格式
+[dependencies]
+edgy-s = { version = "1.3", features = ["server", "client", "serde_json"] }
+```
+
+**注意**：如果启用了多个序列化特性，将使用优先级最高的（postcard > cbor4 > serde_json）。必须至少启用一种序列化后端。
 
 ## 共享状态管理
 

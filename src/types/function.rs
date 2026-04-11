@@ -3,8 +3,9 @@ use super::HttpClientRouter;
 #[cfg(feature = "server")]
 use super::{HttpServerRouter, IntoStreamingBody, StreamingBody};
 use {
-    super::{super::get_path, Accessor, IoResult, WsRouter},
+    super::{super::get_path, Accessor, WsRouter},
     serde::{Deserialize, Serialize},
+    std::io::Result as IoResult,
 };
 
 /// Trait for async functions that can handle WebSocket messages.

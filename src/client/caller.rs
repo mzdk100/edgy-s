@@ -50,12 +50,7 @@ where
         static AUTO_ID: AtomicReqId = AtomicReqId::new(0);
 
         let path = get_path::<F>();
-        let Some(command) = WS_BINDING_SENDERS
-            .lock()
-            .await
-            .get(&path)
-            .cloned()
-        else {
+        let Some(command) = WS_BINDING_SENDERS.lock().await.get(&path).cloned() else {
             return Err(IoError::other(format!(
                 "The `{}` path used by the current `{}` function has not been bound to the client.",
                 path,

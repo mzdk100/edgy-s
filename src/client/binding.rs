@@ -48,12 +48,11 @@ impl<Req, Res> WsBinding<Req, Res> {
         let rt = rt
             .upgrade()
             .ok_or(IoError::other("Runtime already dropped."))?;
-        let request_open_close: RequestOpenClose<Req, Res> =
-            Arc::new(Mutex::new((
-                Box::new(|_| Box::pin(async {}) as _),
-                Box::new(|_| Box::pin(async {}) as _),
-                Box::new(|_| Box::pin(async {}) as _),
-            )));
+        let request_open_close: RequestOpenClose<Req, Res> = Arc::new(Mutex::new((
+            Box::new(|_| Box::pin(async {}) as _),
+            Box::new(|_| Box::pin(async {}) as _),
+            Box::new(|_| Box::pin(async {}) as _),
+        )));
         let request_open_close_clone = request_open_close.clone();
 
         // Single task to handle all signals in parallel

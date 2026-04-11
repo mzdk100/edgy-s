@@ -21,7 +21,13 @@ use {
 };
 
 type Handler<T> = Box<dyn Fn(Accessor<T>) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send>;
-type OpenPayload = (Uri, SocketAddr, HeaderMap, WatchSender<HeaderMap>, OneshotSender<()>);
+type OpenPayload = (
+    Uri,
+    SocketAddr,
+    HeaderMap,
+    WatchSender<HeaderMap>,
+    OneshotSender<()>,
+);
 type ClosePayload = (Uri, SocketAddr, HeaderMap);
 
 /// WebSocket binding for server-side connections.

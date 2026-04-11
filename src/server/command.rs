@@ -11,10 +11,29 @@ use {
     tokio_util::sync::CancellationToken,
 };
 
-type WsStreamSender = MpscSender<(Uri, SocketAddr, HeaderMap, Message, OneshotSender<Option<Message>>)>;
-type OpenSender = MpscSender<(Uri, SocketAddr, HeaderMap, WatchSender<HeaderMap>, OneshotSender<()>)>;
+type WsStreamSender = MpscSender<(
+    Uri,
+    SocketAddr,
+    HeaderMap,
+    Message,
+    OneshotSender<Option<Message>>,
+)>;
+type OpenSender = MpscSender<(
+    Uri,
+    SocketAddr,
+    HeaderMap,
+    WatchSender<HeaderMap>,
+    OneshotSender<()>,
+)>;
 type CloseSender = MpscSender<(Uri, SocketAddr, HeaderMap)>;
-type HttpReqSender = MpscSender<(Uri, SocketAddr, HeaderMap, StreamingBody, OneshotSender<(HeaderMap, StreamingBody)>, CancellationToken)>;
+type HttpReqSender = MpscSender<(
+    Uri,
+    SocketAddr,
+    HeaderMap,
+    StreamingBody,
+    OneshotSender<(HeaderMap, StreamingBody)>,
+    CancellationToken,
+)>;
 
 #[derive(Debug)]
 pub enum Command {

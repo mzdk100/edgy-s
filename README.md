@@ -16,12 +16,13 @@ A minimalist WebSocket/HTTP bidirectional RPC framework for building complex mic
 - **Auto Reconnection** - WebSocket client with configurable retry logic
 - **Builder Pattern** - Flexible client/service configuration
 - **Shared State** - Built-in state management with `Arc<RwLock<S>>` for concurrent access
+- **Multiple Serialization Backends** - Support for postcard (default), CBOR, and JSON
 
 ## Installation
 
 ```toml
 [dependencies]
-edgy-s = { version = "1.1", features = ["server", "client"] }
+edgy-s = { version = "1.3", features = ["server", "client"] }
 ```
 
 ## Quick Start
@@ -321,8 +322,34 @@ Choose the appropriate request ID width based on your concurrency needs:
 
 ```toml
 [dependencies]
-edgy-s = { version = "1.1", features = ["server", "client", "req_id_u32"] }
+edgy-s = { version = "1.3", features = ["server", "client", "req_id_u32"] }
 ```
+
+## Serialization Backend Configuration
+
+Choose one serialization backend based on your needs. The priority is: `postcard` > `cbor4` > `serde_json`.
+
+| Feature | Library | Format | Size | Use Case |
+|---------|---------|--------|------|----------|
+| `postcard` (default) | postcard | Custom binary | **Compact** | Maximum efficiency, embedded systems |
+| `cbor4` | cbor4ii | CBOR | Compact | Wide data type support, standard format |
+| `serde_json` | serde_json | JSON | Larger | Human-readable, debugging, web APIs |
+
+```toml
+# Default: postcard (most compact)
+[dependencies]
+edgy-s = { version = "1.3", features = ["server", "client"] }
+
+# Use CBOR for standard binary format
+[dependencies]
+edgy-s = { version = "1.3", features = ["server", "client", "cbor4"] }
+
+# Use JSON for human-readable output
+[dependencies]
+edgy-s = { version = "1.3", features = ["server", "client", "serde_json"] }
+```
+
+**Note**: If multiple serialization features are enabled, the highest priority one will be used (postcard > cbor4 > serde_json). At least one serialization backend must be enabled.
 
 ## Shared State Management
 
