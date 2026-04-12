@@ -1,6 +1,7 @@
 #[cfg(feature = "serde_json")]
 use serde_json::{Value, from_slice, to_vec};
 use {
+    super::{FromBytes, IntoBytes},
     futures_util::{Stream, StreamExt},
     hyper::{
         Error,
@@ -182,15 +183,21 @@ impl IntoStreamingBody for Incoming {
     }
 }
 
-impl IntoStreamingBody for String {
+impl<'a> IntoStreamingBody for &'a str {
     fn into_streaming_body(self) -> StreamingBody {
-        self.into_bytes().into_streaming_body()
+        IntoBytes::into(self).into_streaming_body()
     }
 }
 
-impl IntoStreamingBody for Vec<u8> {
+impl<'a> IntoStreamingBody for &'a [u8] {
     fn into_streaming_body(self) -> StreamingBody {
-        Bytes::from(self).into_streaming_body()
+        IntoBytes::into(self).into_streaming_body()
+    }
+}
+
+impl IntoStreamingBody for String {
+    fn into_streaming_body(self) -> StreamingBody {
+        IntoBytes::into(self).into_streaming_body()
     }
 }
 
@@ -200,22 +207,10 @@ impl IntoStreamingBody for Bytes {
     }
 }
 
-impl IntoStreamingBody for &str {
-    fn into_streaming_body(self) -> StreamingBody {
-        Bytes::copy_from_slice(self.as_bytes()).into_streaming_body()
-    }
-}
-
-impl IntoStreamingBody for &[u8] {
-    fn into_streaming_body(self) -> StreamingBody {
-        Bytes::copy_from_slice(self).into_streaming_body()
-    }
-}
-
 impl<S, T> IntoStreamingBody for Pin<Box<S>>
 where
     S: Stream<Item = T> + Send + Sync + 'static,
-    Bytes: From<T>,
+    T: IntoBytes,
 {
     fn into_streaming_body(self) -> StreamingBody {
         StreamingBody::Stream {
@@ -280,50 +275,10 @@ impl Stream for StreamingBody {
     }
 }
 
-/// Trait for types that can be created from `Bytes`.
-///
-/// Used for converting streaming body chunks into concrete types.
-pub trait FromBytes {
-    /// Creates this type from a `Bytes` value.
-    fn from(value: Bytes) -> Self;
-}
-
-impl FromBytes for String {
-    fn from(value: Bytes) -> Self {
-        String::from_utf8(value.to_vec()).unwrap_or_default()
-    }
-}
-
-impl FromBytes for Vec<u8> {
-    fn from(value: Bytes) -> Self {
-        value.into()
-    }
-}
-
-impl FromBytes for Box<[u8]> {
-    fn from(value: Bytes) -> Self {
-        value.to_vec().into()
-    }
-}
-
-#[cfg(feature = "serde_json")]
-impl FromBytes for Value {
-    fn from(value: Bytes) -> Self {
-        from_slice(&value).unwrap_or_default()
-    }
-}
-
 #[cfg(feature = "serde_json")]
 impl IntoStreamingBody for Value {
     fn into_streaming_body(self) -> StreamingBody {
         to_vec(&self).unwrap_or_default().into_streaming_body()
-    }
-}
-
-#[cfg(feature = "serde_json")]
-impl From<Value> for StreamingBody {
-    fn from(value: Value) -> Self {
-        to_vec(&value).unwrap_or_default().into_streaming_body()
     }
 }
 

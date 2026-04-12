@@ -41,13 +41,13 @@ async fn main() -> anyhow::Result<()> {
 
     tokio::spawn(async {
         let request_stream = stream! {
-            yield "hello".to_string();
-            yield "world".into();
-            yield ",".into();
-            yield "how".into();
-            yield "are".into();
-            yield "you".into();
-            yield "!".into();
+            yield "hello";
+            yield "world";
+            yield ",";
+            yield "how";
+            yield "are";
+            yield "you";
+            yield "!";
         };
 
         let (mut response_stream, accessor): (
