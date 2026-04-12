@@ -246,6 +246,7 @@ let accessor: HttpAccessor = ().head(handler).await?;
 | `get_other_conns()` | Get other connections to same path (WsAccessor only) |
 | `find_conn(target, predicate)` | Find a WebSocket connection to a specific path matching predicate (WsAccessor only) |
 | `find_ws_conn(target, predicate)` | Find a WebSocket connection to a specific path matching predicate (HttpAccessor only) |
+| `get_all_ws_conns(target)` | Get all WebSocket connections to a specific path (HttpAccessor only) |
 
 #### Client-side (WsAccessor / RequestAccessor)
 

@@ -246,6 +246,7 @@ let accessor: HttpAccessor = ().head(handler).await?;
 | `get_other_conns()` | 获取同路径的其他连接（仅 WsAccessor） |
 | `find_conn(target, predicate)` | 查找连接到特定路径且满足条件的 WebSocket 连接（仅 WsAccessor） |
 | `find_ws_conn(target, predicate)` | 查找连接到特定路径且满足条件的 WebSocket 连接（仅 HttpAccessor） |
+| `get_all_ws_conns(target)` | 获取连接到特定路径的所有 WebSocket 连接（仅 HttpAccessor） |
 
 #### 客户端 (WsAccessor / RequestAccessor)
 

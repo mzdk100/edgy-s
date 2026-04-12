@@ -296,22 +296,23 @@ impl<S> WsConn<S> {
 
     /// Returns all other connections to the same path.
     pub async fn get_other_conns(&self) -> impl Iterator<Item = WsAccessor<S>> {
-        WS_CONNS
-            .lock()
-            .await
-            .iter()
-            .filter(|((path, addr), _)| path == self.uri.path() && *addr != self.socket_addr)
-            .map(|((_, addr), info)| {
-                WsConn::from((
-                    info.uri.clone(),
-                    *addr,
-                    info.headers.clone(),
-                    self.inner.state.clone(),
-                ))
-                .into()
-            })
-            .collect::<Vec<_>>()
-            .into_iter()
+        let target_path = self.uri.path().to_owned();
+        let self_addr = self.socket_addr;
+
+        // Collect only raw data while holding the lock, then release
+        let conn_data = {
+            let conns = WS_CONNS.lock().await;
+            conns
+                .iter()
+                .filter(|((path, addr), _)| path == &target_path && *addr != self_addr)
+                .map(|((_, addr), info)| (info.uri.clone(), *addr, info.headers.clone()))
+                .collect::<Vec<_>>()
+        };
+
+        // Lazily create WsAccessors only when .next() is called
+        conn_data.into_iter().map(|(uri, addr, headers)| {
+            WsConn::from((uri, addr, headers, self.state.clone())).into()
+        })
     }
 }
 
@@ -490,6 +491,56 @@ impl<S> HttpConn<S> {
         P: FnMut(&mut WsAccessor<S>) -> bool,
     {
         find_ws_connection(target, self.inner.state.clone(), predicated).await
+    }
+
+    /// Returns all WebSocket connections to a specific path.
+    ///
+    /// This allows HTTP handlers to access and communicate with all WebSocket
+    /// connections connected to a given path.
+    ///
+    /// # Arguments
+    /// * `target` - A WebSocket handler function whose path will be searched
+    ///
+    /// # Returns
+    /// An iterator of all WebSocket connections to the target path
+    ///
+    /// # Example
+    /// ```ignore
+    /// async fn broadcast_all(accessor: HttpAccessor<AppState>, body: String) -> String {
+    ///     // Get all WebSocket connections to /chat path
+    ///     for ws_conn in accessor.get_all_ws_conns(chat_handler).await {
+    ///         // Send a message to each WebSocket connection
+    ///         let _: String = (body.clone(),)
+    ///             .call_remotely(&ws_conn)
+    ///             .await
+    ///             .unwrap();
+    ///     }
+    ///     format!("Broadcasted to connections")
+    /// }
+    /// ```
+    pub async fn get_all_ws_conns<F, Args, Ret, Acc>(
+        &self,
+        _target: F,
+    ) -> impl Iterator<Item = WsAccessor<S>>
+    where
+        F: WsAsyncFn<Args, Ret, Acc, S>,
+    {
+        let target_path = get_path::<F>();
+
+        // Collect only raw data while holding the lock, then release
+        let conn_data = {
+            let conns = WS_CONNS.lock().await;
+            conns
+                .iter()
+                .filter(|((path, _addr), _info)| path == &target_path)
+                .map(|(key, info)| (info.uri.clone(), key.1, info.headers.clone()))
+                .collect::<Vec<_>>()
+        };
+
+        // Lazily create WsAccessors only when .next() is called
+        conn_data.into_iter().map(|(uri, addr, headers)| {
+            WsConn::from((uri, addr, headers, self.state.clone())).into()
+        })
     }
 }
 
