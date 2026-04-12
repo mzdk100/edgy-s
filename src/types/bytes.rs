@@ -22,7 +22,7 @@ impl FromBytes for Vec<u8> {
 
 impl FromBytes for Box<[u8]> {
     fn from(value: Bytes) -> Self {
-        value.to_vec().into()
+        From::from(value.to_vec())
     }
 }
 
@@ -32,13 +32,13 @@ pub trait IntoBytes {
     fn into(self) -> Bytes;
 }
 
-impl<'a> IntoBytes for &'a str {
+impl IntoBytes for &str {
     fn into(self) -> Bytes {
         Bytes::copy_from_slice(self.as_bytes())
     }
 }
 
-impl<'a> IntoBytes for &'a [u8] {
+impl IntoBytes for &[u8] {
     fn into(self) -> Bytes {
         Bytes::copy_from_slice(self)
     }
@@ -47,6 +47,12 @@ impl<'a> IntoBytes for &'a [u8] {
 impl IntoBytes for String {
     fn into(self) -> Bytes {
         Bytes::copy_from_slice(self.as_bytes())
+    }
+}
+
+impl IntoBytes for Vec<u8> {
+    fn into(self) -> Bytes {
+        From::from(self)
     }
 }
 
@@ -60,6 +66,6 @@ impl FromBytes for Value {
 #[cfg(feature = "serde_json")]
 impl IntoBytes for Value {
     fn into(self) -> Bytes {
-        to_vec(&self).unwrap_or_default().into()
+        From::from(to_vec(&self).unwrap_or_default())
     }
 }

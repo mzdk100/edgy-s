@@ -183,13 +183,13 @@ impl IntoStreamingBody for Incoming {
     }
 }
 
-impl<'a> IntoStreamingBody for &'a str {
+impl IntoStreamingBody for &str {
     fn into_streaming_body(self) -> StreamingBody {
         IntoBytes::into(self).into_streaming_body()
     }
 }
 
-impl<'a> IntoStreamingBody for &'a [u8] {
+impl IntoStreamingBody for &[u8] {
     fn into_streaming_body(self) -> StreamingBody {
         IntoBytes::into(self).into_streaming_body()
     }
