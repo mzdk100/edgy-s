@@ -13,7 +13,7 @@ use {
     binding::{HttpBinding, WsBinding},
     builder::EdgyServiceBuilder,
     caller::BIND_SENDERS,
-    command::Command,
+    command::{Command, HttpReqSender},
     conn::{HttpConn, WS_CONNS, WsConn},
     futures_util::future::{AbortHandle, Abortable},
     handler::WebHandler,
@@ -210,55 +210,7 @@ where
         P: AsRef<str>,
         Ret: IntoStreamingBody,
     {
-        let (req_tx, mut req_rx) = mpsc_channel::<(
-            Uri,
-            SocketAddr,
-            HeaderMap,
-            StreamingBody,
-            OneshotSender<_>,
-            CancellationToken,
-        )>(2);
-        let state = self.state.clone();
-        let task = self.rt.spawn(async move {
-            while let Some((uri, addr, headers, body, ret_tx, cancel_token)) = req_rx.recv().await {
-                let (headers_tx, headers_rx) = watch_channel(Default::default());
-                let (status_tx, status_rx) = watch_channel(StatusCode::OK);
-                let accessor =
-                    HttpConn::from((uri, addr, headers, state.clone(), headers_tx, status_tx))
-                        .into();
-
-                // Create abortable future so we can cancel the handler
-                let (abort_handle, abort_registration) = AbortHandle::new_pair();
-                let abortable_future =
-                    Abortable::new(handler.call(accessor, body.into()), abort_registration);
-
-                let ret = select! {
-                    biased;
-                    _ = cancel_token.cancelled() => {
-                        // Connection was canceled, abort the handler
-                        abort_handle.abort();
-                        continue;
-                    }
-                    result = abortable_future => {
-                        match result {
-                            Ok(r) => r,
-                            Err(_) => {
-                                // Handler was aborted
-                                continue;
-                            }
-                        }
-                    }
-                };
-
-                let response_headers = headers_rx.borrow().clone();
-                let response_status = *status_rx.borrow();
-                if let Err(e) =
-                    ret_tx.send((response_headers, response_status, ret.into_streaming_body()))
-                {
-                    error!(?e, "Unable to send data.");
-                }
-            }
-        });
+        let (req_tx, task) = Self::spawn_http_handler(handler, &self.state, &self.rt);
 
         let (ret_tx, ret_rx) = oneshot_channel();
         self.command
@@ -285,6 +237,33 @@ where
             })
             .await?;
         ret_rx.await.map_err(IoError::other)?
+    }
+
+    async fn add_default_route<F, Body, Ret>(&self, handler: F) -> IoResult<Self::Binding>
+    where
+        F: HttpServerAsyncFn<Body, Ret, HttpConn<S>, S>,
+        Body: From<StreamingBody>,
+        Ret: IntoStreamingBody,
+    {
+        let (req_tx, task) = Self::spawn_http_handler(handler, &self.state, &self.rt);
+
+        let (ret_tx, ret_rx) = oneshot_channel();
+        self.command
+            .send(Command::SetDefaultHttpRoute {
+                req_tx,
+                task,
+                opt_return: ret_tx,
+            })
+            .await
+            .map_err(IoError::other)?;
+        ret_rx.await.map_err(IoError::other)??;
+
+        Ok(HttpBinding::new_default(self.command.downgrade()))
+    }
+
+    async fn remove_default_route() -> IoResult<()> {
+        // Binding::unbind handles default route removal via the binding's command channel
+        unreachable!("Use Binding::unbind on the default route binding instead")
     }
 }
 
@@ -345,10 +324,72 @@ impl<S> EdgyService<S> {
         self.worker_task.abort();
     }
 
+    fn spawn_http_handler<F, Body, Ret>(
+        handler: F,
+        state: &State<S>,
+        rt: &Arc<Runtime>,
+    ) -> (HttpReqSender, JoinHandle<()>)
+    where
+        F: HttpServerAsyncFn<Body, Ret, HttpConn<S>, S>,
+        Body: From<StreamingBody>,
+        Ret: IntoStreamingBody,
+        S: Send + Sync + 'static,
+    {
+        let (req_tx, mut req_rx) = mpsc_channel::<(
+            Uri,
+            SocketAddr,
+            HeaderMap,
+            StreamingBody,
+            OneshotSender<_>,
+            CancellationToken,
+        )>(2);
+        let state = Arc::downgrade(state);
+
+        let task = rt.spawn(async move {
+            while let Some((uri, addr, headers, body, ret_tx, cancel_token)) = req_rx.recv().await
+                && let Some(state) = state.upgrade()
+            {
+                let (headers_tx, headers_rx) = watch_channel(Default::default());
+                let (status_tx, status_rx) = watch_channel(StatusCode::OK);
+                let accessor =
+                    HttpConn::from((uri, addr, headers, state, headers_tx, status_tx)).into();
+
+                let (abort_handle, abort_registration) = AbortHandle::new_pair();
+                let abortable_future =
+                    Abortable::new(handler.call(accessor, body.into()), abort_registration);
+
+                let ret = select! {
+                    biased;
+                    _ = cancel_token.cancelled() => {
+                        abort_handle.abort();
+                        continue;
+                    }
+                    result = abortable_future => {
+                        match result {
+                            Ok(r) => r,
+                            Err(_) => continue,
+                        }
+                    }
+                };
+
+                let response_headers = headers_rx.borrow().clone();
+                let response_status = *status_rx.borrow();
+                if let Err(e) =
+                    ret_tx.send((response_headers, response_status, ret.into_streaming_body()))
+                {
+                    error!(?e, "Unable to send data.");
+                }
+            }
+        });
+
+        (req_tx, task)
+    }
+
     async fn worker(mut command: MpscReceiver<Command>) -> IoResult<()> {
         let mut http_handlers = HashMap::new();
         let mut ws_handlers = HashMap::new();
         let mut pending_requests = HashMap::new();
+        let mut default_http_handler: Option<(HttpReqSender, JoinHandle<()>)> = None;
 
         while let Some(item) = command.recv().await {
             match item {
@@ -452,7 +493,7 @@ impl<S> EdgyService<S> {
                     }
                 }
 
-                Command::WsOpen { uri, socket_addr, headers, res_tx: response_tx } => {
+                Command::WsOpen { uri, socket_addr, headers, open_tx: response_tx } => {
                     if let Some((_, open, _)) = ws_handlers.get(uri.path()) {
                         let (headers_tx, headers_rx) = watch_channel(Default::default());
                         let (status_tx, status_rx) = watch_channel(StatusCode::SWITCHING_PROTOCOLS);
@@ -467,15 +508,54 @@ impl<S> EdgyService<S> {
                     };
                 }
 
-                Command::WsClose {uri, socket_addr, headers} => if let Some((_, _, close)) = ws_handlers.get(uri.path())
-                    && let Err(e) = close.send((uri, socket_addr, headers, )).await {
+                Command::WsClose {uri, socket_addr, headers} => {
+                    let keys_to_remove: Vec<_> = pending_requests
+                        .keys()
+                        .filter(|(p, addr, _)| p == uri.path() && addr == &socket_addr)
+                        .cloned()
+                        .collect();
+                    for key in keys_to_remove {
+                        if let Some(tx) = pending_requests.remove(&key) {
+                            let _ = tx.send(Err(IoError::other(format!(
+                                "Connection to `{}` at `{}` has been closed.",
+                                socket_addr, uri.path()
+                            ))));
+                        }
+                    }
+                    if let Some((_, _, close)) = ws_handlers.get(uri.path())
+                        && let Err(e) = close.send((uri, socket_addr, headers, )).await {
                         error!(?e, "Unable to close connection.");
                     }
+                }
 
                 Command::Request {uri, socket_addr, headers, body, ret_tx, cancel_token} => {
                     if let Some((handler, _)) = http_handlers.get(uri.path()) {
                         handler.send((uri, socket_addr, headers, body, ret_tx, cancel_token)).await.map_or_else(|e| Err(IoError::other(e)), Ok)?;
+                    } else if let Some((handler, _)) = &default_http_handler {
+                        handler.send((uri, socket_addr, headers, body, ret_tx, cancel_token)).await.map_or_else(|e| Err(IoError::other(e)), Ok)?;
+                    } else {
+                        let _ = ret_tx.send((Default::default(), StatusCode::NOT_FOUND, "Not Found".into_streaming_body()));
                     }
+                }
+
+                Command::SetDefaultHttpRoute { req_tx, task, opt_return } => {
+                    opt_return
+                        .send(if default_http_handler.is_some() {
+                            Err(IoError::other("Default HTTP route already exists"))
+                        } else {
+                            default_http_handler = Some((req_tx, task));
+                            Ok(())
+                        })
+                        .map_or_else(|e| e.map_err(IoError::other), Ok)?;
+                }
+
+                Command::RemoveDefaultHttpRoute { opt_return } => {
+                    opt_return
+                        .send(default_http_handler.take().map_or(
+                            Err(IoError::other("No default HTTP route to remove")),
+                            |(_, task)| { task.abort(); Ok(()) },
+                        ))
+                        .map_or_else(|e| e, Ok)?;
                 }
             }
         }

@@ -27,7 +27,7 @@ type OpenSender = MpscSender<(
     OneshotSender<()>,
 )>;
 type CloseSender = MpscSender<(Uri, SocketAddr, HeaderMap)>;
-type HttpReqSender = MpscSender<(
+pub(super) type HttpReqSender = MpscSender<(
     Uri,
     SocketAddr,
     HeaderMap,
@@ -99,12 +99,22 @@ pub enum Command {
         uri: Uri,
         socket_addr: SocketAddr,
         headers: HeaderMap,
-        res_tx: OneshotSender<(HeaderMap, StatusCode)>,
+        open_tx: OneshotSender<(HeaderMap, StatusCode)>,
     },
 
     WsClose {
         uri: Uri,
         socket_addr: SocketAddr,
         headers: HeaderMap,
+    },
+
+    SetDefaultHttpRoute {
+        req_tx: HttpReqSender,
+        task: JoinHandle<()>,
+        opt_return: OneshotSender<IoResult<()>>,
+    },
+
+    RemoveDefaultHttpRoute {
+        opt_return: OneshotSender<IoResult<()>>,
     },
 }

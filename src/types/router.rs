@@ -112,4 +112,21 @@ pub trait HttpServerRouter<Acc, S = ()> {
         Ret: IntoStreamingBody;
 
     fn remove_route(binding: Self::Binding) -> impl Future<Output = IoResult<()>>;
+
+    /// Registers a default HTTP handler for unmatched routes.
+    ///
+    /// If a request arrives for a path that has no registered route,
+    /// this handler will be invoked. If no default handler is set,
+    /// unmatched requests return a 500 Internal Server Error.
+    fn add_default_route<F, Body, Ret>(
+        &self,
+        handler: F,
+    ) -> impl Future<Output = IoResult<Self::Binding>>
+    where
+        F: HttpServerAsyncFn<Body, Ret, Acc, S>,
+        Body: From<StreamingBody>,
+        Ret: IntoStreamingBody;
+
+    /// Removes the default HTTP handler, restoring the default 500 behavior.
+    fn remove_default_route() -> impl Future<Output = IoResult<()>>;
 }

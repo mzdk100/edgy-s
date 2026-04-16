@@ -15,7 +15,7 @@ use {
     tokio::{
         runtime::Runtime,
         select,
-        sync::{Mutex, mpsc::WeakSender, watch::Sender as WatchSender},
+        sync::{Mutex, mpsc::WeakSender, oneshot::channel as oneshot_channel, watch::Sender as WatchSender},
     },
     tracing::error,
 };
@@ -166,6 +166,7 @@ impl<O, C> Deref for WsBinding<O, C> {
 /// Manages an HTTP route registration on the server side.
 pub struct HttpBinding<S> {
     base: BaseBinding<Command>,
+    is_default: bool,
     _s: PhantomData<S>,
 }
 
@@ -176,6 +177,15 @@ impl<S> HttpBinding<S> {
     {
         Self {
             base: BaseBinding::new(path, command),
+            is_default: false,
+            _s: Default::default(),
+        }
+    }
+
+    pub(super) fn new_default(command: WeakSender<Command>) -> Self {
+        Self {
+            base: BaseBinding::new("", command),
+            is_default: true,
             _s: Default::default(),
         }
     }
@@ -186,7 +196,14 @@ where
     S: Send + Sync + 'static,
 {
     async fn unbind(self) -> IoResult<()> {
-        <EdgyService<S> as HttpServerRouter<HttpConn<S>, S>>::remove_route(self).await
+        if self.is_default {
+            let (ret_tx, ret_rx) = oneshot_channel();
+            self.send_command(Command::RemoveDefaultHttpRoute { opt_return: ret_tx })
+                .await?;
+            ret_rx.await.map_err(IoError::other)?
+        } else {
+            <EdgyService<S> as HttpServerRouter<HttpConn<S>, S>>::remove_route(self).await
+        }
     }
 }
 

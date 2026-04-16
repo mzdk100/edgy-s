@@ -137,6 +137,20 @@ where
         router.add_route::<_, _, Body, Ret>(get_path::<Self>(), self)
     }
 
+    /// Binds this handler as the default HTTP route for unmatched paths.
+    ///
+    /// If a request arrives for a path that has no registered route,
+    /// this handler will be invoked. If no default handler is set,
+    /// unmatched requests return a 500 Internal Server Error.
+    fn bind_as_default<R>(self, router: &R) -> impl Future<Output = IoResult<R::Binding>>
+    where
+        R: HttpServerRouter<Acc, S>,
+        Body: From<StreamingBody>,
+        Ret: IntoStreamingBody,
+    {
+        router.add_default_route::<_, Body, Ret>(self)
+    }
+
     fn call(self, accessor: Accessor<Acc>, body: Body) -> impl Future<Output = Ret> + Send;
 }
 

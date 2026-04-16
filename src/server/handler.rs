@@ -18,6 +18,8 @@ use {
         upgrade::on,
     },
     std::{
+        collections::VecDeque,
+        convert::identity,
         io::{Error as IoError, ErrorKind, Result as IoResult},
         net::{IpAddr, SocketAddr},
         pin::Pin,
@@ -27,7 +29,7 @@ use {
     tokio::{
         runtime::Runtime,
         sync::{
-            mpsc::{Sender as MpscSender, channel as mpsc_channel},
+            mpsc::{Sender as MpscSender, WeakSender, channel as mpsc_channel},
             oneshot::{Sender as OneshotSender, channel as oneshot_channel},
         },
     },
@@ -77,62 +79,41 @@ impl HyperService<Request<Incoming>> for WebHandler {
                 .unwrap_or(false)
             || key.is_none()
         {
-            let command = self.command.clone();
             let uri = req.uri().to_owned();
             let headers = req.headers().clone();
             let body = req.into_body().into_streaming_body();
             let cancel_token = self.cancel_token.child_token();
+            let command = self.command.downgrade();
 
             return Box::pin(async move {
                 Ok(
                     Self::http_dispatch(command, uri, socket_addr, headers, body, cancel_token)
                         .await
-                        .unwrap_or_else(|e| {
-                            let mut res = Response::new(
-                                format!("Internal Server Error: {}", e).into_streaming_body(),
-                            );
-                            *res.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
-                            res
-                        }),
+                        .unwrap_or_else(Self::internal_error),
                 )
             });
         }
 
-        let derived = key.map(|k| derive_accept_key(k.as_bytes()));
         let rt = self.rt.clone();
-        let (tx, rx) = oneshot_channel();
+        let (res_tx, res_rx) = oneshot_channel();
         if let Some(rt2) = rt.upgrade() {
+            let key = key.cloned();
             rt2.spawn(Self::ws_dispatch(
                 rt,
-                self.command.clone(),
+                self.command.downgrade(),
                 socket_addr,
                 req,
-                tx,
+                res_tx,
+                ver,
+                key,
             ));
         };
 
         Box::pin(async move {
-            let mut res = Response::new(Default::default());
-            let (headers, status) = rx.await.map_err(IoError::other)?;
-            *res.headers_mut() = headers;
-            *res.status_mut() = status;
-            *res.version_mut() = ver;
-            res.headers_mut()
-                .append(CONNECTION, HeaderValue::from_static(Self::UPGRADE_VALUE));
-            res.headers_mut()
-                .append(UPGRADE, HeaderValue::from_static(Self::WEBSOCKET_VALUE));
-            if let Some(derived) = derived {
-                res.headers_mut().append(
-                    SEC_WEBSOCKET_ACCEPT,
-                    derived
-                        .parse()
-                        .map_err(|e| IoError::new(ErrorKind::ConnectionRefused, e))?,
-                );
-            }
-            res.headers_mut()
-                .insert("Access-Control-Allow-Origin", HeaderValue::from_static("*"));
-
-            Ok(res)
+            Ok(res_rx
+                .await
+                .map_or_else(|e| Err(IoError::other(e)), identity)
+                .unwrap_or_else(Self::internal_error))
         })
     }
 }
@@ -161,8 +142,15 @@ impl WebHandler {
         }
     }
 
+    fn internal_error(error: IoError) -> Response<StreamingBody> {
+        let mut res =
+            Response::new(format!("Internal Server Error: {}", error).into_streaming_body());
+        *res.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+        res
+    }
+
     async fn http_dispatch(
-        command: MpscSender<Command>,
+        command: WeakSender<Command>,
         uri: Uri,
         socket_addr: SocketAddr,
         headers: HeaderMap,
@@ -171,6 +159,8 @@ impl WebHandler {
     ) -> IoResult<Response<StreamingBody>> {
         let (tx, rx) = oneshot_channel();
         command
+            .upgrade()
+            .ok_or_else(|| IoError::new(ErrorKind::BrokenPipe, "command channel closed"))?
             .send(Command::Request {
                 uri,
                 socket_addr,
@@ -181,44 +171,106 @@ impl WebHandler {
             })
             .await
             .map_err(IoError::other)?;
-        let (response_headers, response_status, response_body) =
-            rx.await.map_err(IoError::other)?;
-        let mut res = Response::new(response_body);
-        *res.headers_mut() = response_headers;
-        *res.status_mut() = response_status;
+
+        let (headers, status, body) = rx.await.map_err(IoError::other)?;
+        let mut res = Response::new(body);
+        *res.headers_mut() = headers;
+        *res.status_mut() = status;
 
         Ok(res)
     }
 
     async fn ws_dispatch(
         rt: Weak<Runtime>,
-        command: MpscSender<Command>,
+        command: WeakSender<Command>,
         socket_addr: SocketAddr,
         req: Request<Incoming>,
-        open_tx: OneshotSender<(HeaderMap, StatusCode)>,
+        res_tx: OneshotSender<IoResult<Response<StreamingBody>>>,
+        ver: Version,
+        key: Option<HeaderValue>,
     ) {
         let uri = req.uri().to_owned();
         info!("Establish bidi-communication {}", uri);
-
         let headers = req.headers().clone();
-        if let Err(e) = command
-            .send(Command::WsOpen {
-                uri: uri.to_owned(),
-                socket_addr,
-                headers: headers.clone(),
-                res_tx: open_tx,
-            })
-            .await
-        {
-            return error!(?e, "Failed to send websocket open command.");
+        let (open_tx, open_rx) = oneshot_channel();
+
+        if let Some(command) = command.upgrade() {
+            if let Err(e) = command
+                .send(Command::WsOpen {
+                    uri: uri.to_owned(),
+                    socket_addr,
+                    headers: headers.clone(),
+                    open_tx,
+                })
+                .await
+            {
+                if let Err(e) = res_tx.send(Err(IoError::other(format!(
+                    "Failed to send websocket open command. {}",
+                    e
+                )))) {
+                    error!(?e, "Failed to send websocket open response.");
+                }
+                return;
+            }
+        } else {
+            if let Err(e) = res_tx.send(Err(IoError::other(
+                "Failed to upgrade websocket command channel.",
+            ))) {
+                error!(?e, "Failed to send websocket open response.");
+            }
+            return;
+        }
+        let (mut res_headers, res_status) = match open_rx.await {
+            Ok(o) => o,
+            Err(e) => {
+                if let Err(e) = res_tx.send(Err(IoError::other(format!(
+                    "Failed to open websocket. {}",
+                    e
+                )))) {
+                    error!(?e, "Failed to send websocket open response.");
+                }
+                return;
+            }
+        };
+        if let Some(derived) = key.map(|k| derive_accept_key(k.as_bytes())) {
+            match derived.parse() {
+                Ok(d) => {
+                    res_headers.append(SEC_WEBSOCKET_ACCEPT, d);
+                }
+                Err(e) => {
+                    if let Err(e) = res_tx.send(Err(IoError::other(format!(
+                        "Failed to derive websocket accept key. {}",
+                        e
+                    )))) {
+                        error!(?e, "Failed to send websocket open response.");
+                    }
+                    return;
+                }
+            }
+        }
+        res_headers.append(CONNECTION, HeaderValue::from_static(Self::UPGRADE_VALUE));
+        res_headers.append(UPGRADE, HeaderValue::from_static(Self::WEBSOCKET_VALUE));
+        res_headers.insert("Access-Control-Allow-Origin", HeaderValue::from_static("*"));
+
+        let mut res = Response::new(StreamingBody::default());
+        *res.version_mut() = ver;
+        *res.headers_mut() = res_headers;
+        *res.status_mut() = res_status;
+        if let Err(e) = res_tx.send(Ok(res)) {
+            error!(?e, "Failed to send websocket open response.");
+            return;
         }
 
         let stream = match on(req).await {
             Ok(upgraded) => {
                 WebSocketStream::from_raw_socket(TokioIo::new(upgraded), Role::Server, None).await
             }
-            Err(e) => return error!(?e, "Upgrade error."),
+            Err(e) => {
+                error!(?e, "Upgrade error.");
+                return;
+            }
         };
+
         let (mut outgoing, mut incoming) = stream.split();
         let (tx, mut rx) = mpsc_channel(2);
         if WS_CONNS
@@ -243,52 +295,96 @@ impl WebHandler {
             socket_addr,
             headers: headers.clone(),
             rt,
-            command: command.downgrade(),
+            command: command.clone(),
         };
 
-        loop {
-            match select(incoming.next(), Box::pin(rx.recv())).await {
-                Either::Left((Some(Ok(Message::Close(c))), _)) => {
-                    dbg!(c);
-                    break;
-                }
-                Either::Left((None, _)) | Either::Right((None, _)) => break,
+        // Buffer for messages received while waiting for handler response
+        let mut pending_incoming: VecDeque<Message> = VecDeque::new();
 
-                Either::Left((Some(Ok(msg)), _)) => {
-                    let (ret_tx, ret_rx) = oneshot_channel();
-                    if let Err(e) = command
-                        .send(Command::Transfer {
-                            socket_addr,
-                            uri: uri.clone(),
-                            headers: headers.clone(),
-                            msg,
-                            ret_tx,
-                        })
-                        .await
-                    {
-                        error!(?e, "Can't handle the message.")
+        loop {
+            // Check for buffered messages or wait for new events
+            let msg = if let Some(msg) = pending_incoming.pop_front() {
+                msg
+            } else {
+                match select(incoming.next(), Box::pin(rx.recv())).await {
+                    Either::Left((Some(Ok(Message::Close(c))), _)) => {
+                        dbg!(c);
+                        break;
+                    }
+                    Either::Left((None, _)) | Either::Right((None, _)) => break,
+
+                    Either::Left((Some(Ok(msg)), _)) => msg,
+
+                    Either::Right((Some(msg), _)) => {
+                        if let Err(e) = outgoing.send(msg).await {
+                            error!(?e, "Can't send the message.");
+                        }
+                        continue;
                     }
 
-                    match ret_rx.await {
-                        Ok(Some(msg)) => {
-                            if let Err(e) = outgoing.send(msg).await {
-                                error!(?e, "Can't send the message.");
+                    Either::Left((Some(Err(e)), _)) => {
+                        error!(?e, "Received error.");
+                        break;
+                    }
+                }
+            };
+
+            // Process incoming message: forward to handler and wait for response
+            let (ret_tx, ret_rx) = oneshot_channel();
+            let Some(command) = command.upgrade() else {
+                error!("Can't upgrade command channel.");
+                break;
+            };
+
+            if let Err(e) = command
+                .send(Command::Transfer {
+                    socket_addr,
+                    uri: uri.clone(),
+                    headers: headers.clone(),
+                    msg,
+                    ret_tx,
+                })
+                .await
+            {
+                error!(?e, "Can't handle the message.")
+            }
+
+            // Wait for handler response while also detecting connection errors.
+            // If the connection drops while we wait, we must return immediately
+            // so the WsConnGuard is dropped, which sends CleanupConnection to
+            // cancel any pending call_remotely requests for this connection.
+            let mut ret_rx = ret_rx;
+            loop {
+                tokio::select! {
+                    biased;
+                    result = &mut ret_rx => {
+                        match result {
+                            Ok(Some(msg)) => {
+                                if let Err(e) = outgoing.send(msg).await {
+                                    error!(?e, "Can't send the message.");
+                                }
+                            }
+                            Err(e) => error!(?e, "Can't receive the message."),
+                            _ => (),
+                        }
+                        break;
+                    }
+                    incoming_result = incoming.next() => {
+                        match incoming_result {
+                            Some(Ok(Message::Close(c))) => {
+                                dbg!(c);
+                                return;
+                            }
+                            Some(Err(e)) => {
+                                error!(?e, "Received error while waiting for handler response.");
+                                return;
+                            }
+                            None => return,
+                            Some(Ok(msg)) => {
+                                pending_incoming.push_back(msg);
                             }
                         }
-                        Err(e) => error!(?e, "Can't receive the message."),
-                        _ => (),
                     }
-                }
-
-                Either::Right((Some(msg), _)) => {
-                    if let Err(e) = outgoing.send(msg).await {
-                        error!(?e, "Can't send the message.");
-                    }
-                }
-
-                Either::Left((Some(Err(e)), _)) => {
-                    error!(?e, "Received error.");
-                    break;
                 }
             }
         }
