@@ -3,10 +3,7 @@ use {
         Command, IntoStreamingBody, StreamingBody, TokioIo,
         conn::{ConnInfo, WS_CONNS, WsConnGuard},
     },
-    futures_util::{
-        SinkExt, StreamExt,
-        future::{Either, select},
-    },
+    futures_util::{SinkExt, StreamExt, stream::FuturesUnordered},
     hyper::{
         HeaderMap, Request, Response, StatusCode, Uri, Version,
         body::Incoming,
@@ -18,7 +15,6 @@ use {
         upgrade::on,
     },
     std::{
-        collections::VecDeque,
         convert::identity,
         io::{Error as IoError, ErrorKind, Result as IoResult},
         net::{IpAddr, SocketAddr},
@@ -298,92 +294,70 @@ impl WebHandler {
             command: command.clone(),
         };
 
-        // Buffer for messages received while waiting for handler response
-        let mut pending_incoming: VecDeque<Message> = VecDeque::new();
+        // Track pending handler responses (multiple can be in-flight concurrently)
+        let mut pending_responses = FuturesUnordered::new();
 
         loop {
-            // Check for buffered messages or wait for new events
-            let msg = if let Some(msg) = pending_incoming.pop_front() {
-                msg
-            } else {
-                match select(incoming.next(), Box::pin(rx.recv())).await {
-                    Either::Left((Some(Ok(Message::Close(c))), _)) => {
-                        dbg!(c);
-                        break;
-                    }
-                    Either::Left((None, _)) | Either::Right((None, _)) => break,
-
-                    Either::Left((Some(Ok(msg)), _)) => msg,
-
-                    Either::Right((Some(msg), _)) => {
-                        if let Err(e) = outgoing.send(msg).await {
-                            error!(?e, "Can't send the message.");
+            tokio::select! {
+                // 1. Server-initiated call (call_remotely): forward to client via outgoing.
+                //    Must always be polled — a handler may call_remotely while its
+                //    response is still pending, so we must drain rx to avoid deadlock.
+                msg = rx.recv() => {
+                    match msg {
+                        Some(msg) => {
+                            if let Err(e) = outgoing.send(msg).await {
+                                error!(?e, "Can't send the message.");
+                            }
                         }
-                        continue;
-                    }
-
-                    Either::Left((Some(Err(e)), _)) => {
-                        error!(?e, "Received error.");
-                        break;
+                        None => break,
                     }
                 }
-            };
 
-            // Process incoming message: forward to handler and wait for response
-            let (ret_tx, ret_rx) = oneshot_channel();
-            let Some(command) = command.upgrade() else {
-                error!("Can't upgrade command channel.");
-                break;
-            };
-
-            if let Err(e) = command
-                .send(Command::Transfer {
-                    socket_addr,
-                    uri: uri.clone(),
-                    headers: headers.clone(),
-                    msg,
-                    ret_tx,
-                })
-                .await
-            {
-                error!(?e, "Can't handle the message.")
-            }
-
-            // Wait for handler response while also detecting connection errors.
-            // If the connection drops while we wait, we must return immediately
-            // so the WsConnGuard is dropped, which sends CleanupConnection to
-            // cancel any pending call_remotely requests for this connection.
-            let mut ret_rx = ret_rx;
-            loop {
-                tokio::select! {
-                    biased;
-                    result = &mut ret_rx => {
-                        match result {
-                            Ok(Some(msg)) => {
-                                if let Err(e) = outgoing.send(msg).await {
-                                    error!(?e, "Can't send the message.");
-                                }
+                // 2. Handler response ready: send to client
+                Some(result) = pending_responses.next() => {
+                    match result {
+                        Ok(Some(msg)) => {
+                            if let Err(e) = outgoing.send(msg).await {
+                                error!(?e, "Can't send the message.");
                             }
-                            Err(e) => error!(?e, "Can't receive the message."),
-                            _ => (),
                         }
-                        break;
+                        Err(e) => error!(?e, "Can't receive the message."),
+                        _ => (),
                     }
-                    incoming_result = incoming.next() => {
-                        match incoming_result {
-                            Some(Ok(Message::Close(c))) => {
-                                dbg!(c);
-                                return;
-                            }
-                            Some(Err(e)) => {
-                                error!(?e, "Received error while waiting for handler response.");
-                                return;
-                            }
-                            None => return,
-                            Some(Ok(msg)) => {
-                                pending_incoming.push_back(msg);
-                            }
+                }
+
+                // 3. Incoming message from client: forward to handler
+                incoming_result = incoming.next() => {
+                    match incoming_result {
+                        Some(Ok(Message::Close(c))) => {
+                            dbg!(c);
+                            break;
                         }
+                        Some(Ok(msg)) => {
+                            let (ret_tx, ret_rx) = oneshot_channel();
+                            let Some(cmd) = command.upgrade() else {
+                                error!("Can't upgrade command channel.");
+                                break;
+                            };
+                            if let Err(e) = cmd
+                                .send(Command::Transfer {
+                                    socket_addr,
+                                    uri: uri.clone(),
+                                    headers: headers.clone(),
+                                    msg,
+                                    ret_tx,
+                                })
+                                .await
+                            {
+                                error!(?e, "Can't handle the message.");
+                            }
+                            pending_responses.push(ret_rx);
+                        }
+                        Some(Err(e)) => {
+                            error!(?e, "Received error.");
+                            break;
+                        }
+                        None => break,
                     }
                 }
             }

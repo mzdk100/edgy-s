@@ -472,8 +472,13 @@ impl<S> EdgyService<S> {
                     if let Some(conn) = WS_CONNS.lock().await.get(&(path.clone(), socket_addr)) {
                         if let Err(e) = conn.sender.send(msg).await {
                             error!(?e, "Unable to send message.");
+                            let _ = ret_tx.send(Err(IoError::other(format!(
+                                "Failed to send message to connection at `{}`: {}",
+                                socket_addr, e
+                            ))));
+                        } else {
+                            pending_requests.insert((path.clone(), socket_addr, id), ret_tx);
                         }
-                        pending_requests.insert((path.clone(), socket_addr, id), ret_tx);
                     } else if let Err(e)
                         =ret_tx.send(Err(IoError::other(format!("The connection to the `{}` address may have been closed, or the address does not belong to a connection at the `{}` path and cannot handle this request.", socket_addr, path)))) {
                         error!(?e, "Unable to send error message.");

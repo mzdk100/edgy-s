@@ -15,7 +15,10 @@ use {
     tokio::{
         runtime::Runtime,
         select,
-        sync::{Mutex, mpsc::WeakSender, oneshot::channel as oneshot_channel, watch::Sender as WatchSender},
+        sync::{
+            Mutex, mpsc::WeakSender, oneshot::channel as oneshot_channel,
+            watch::Sender as WatchSender,
+        },
     },
     tracing::error,
 };
