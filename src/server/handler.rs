@@ -15,7 +15,6 @@ use {
         upgrade::on,
     },
     std::{
-        convert::identity,
         io::{Error as IoError, ErrorKind, Result as IoResult},
         net::{IpAddr, SocketAddr},
         pin::Pin,
@@ -108,7 +107,7 @@ impl HyperService<Request<Incoming>> for WebHandler {
         Box::pin(async move {
             Ok(res_rx
                 .await
-                .map_or_else(|e| Err(IoError::other(e)), identity)
+                .unwrap_or_else(|e| Err(IoError::other(e)))
                 .unwrap_or_else(Self::internal_error))
         })
     }

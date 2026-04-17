@@ -1,7 +1,7 @@
 #[cfg(feature = "client")]
 use super::HttpClientAsyncFn;
 #[cfg(feature = "server")]
-use super::{HttpServerAsyncFn, IntoStreamingBody, StreamingBody};
+use super::{FromStreamingBody, HttpServerAsyncFn, IntoStreamingBody};
 use {
     super::WsAsyncFn,
     serde::{Deserialize, Serialize},
@@ -107,7 +107,7 @@ pub trait HttpServerRouter<Acc, S = ()> {
     ) -> impl Future<Output = IoResult<Self::Binding>>
     where
         F: HttpServerAsyncFn<Body, Ret, Acc, S>,
-        Body: From<StreamingBody>,
+        Body: FromStreamingBody,
         P: AsRef<str>,
         Ret: IntoStreamingBody;
 
@@ -124,7 +124,7 @@ pub trait HttpServerRouter<Acc, S = ()> {
     ) -> impl Future<Output = IoResult<Self::Binding>>
     where
         F: HttpServerAsyncFn<Body, Ret, Acc, S>,
-        Body: From<StreamingBody>,
+        Body: FromStreamingBody,
         Ret: IntoStreamingBody;
 
     /// Removes the default HTTP handler, restoring the default 500 behavior.

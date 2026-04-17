@@ -1,7 +1,7 @@
 use {
     super::{
         super::{
-            types::{Accessor, HttpClientAsyncFn, IntoStreamingBody, StreamingBody},
+            types::{Accessor, FromStreamingBody, HttpClientAsyncFn, IntoStreamingBody},
             utils::{append_query_params, build_uri, get_path},
         },
         HttpAccessor, HttpCall, IoError, IoResult, RequestConn, ResponseConn,
@@ -38,7 +38,7 @@ pub(super) static HTTP_BINDING_SENDERS: LazyLock<Mutex<HashMap<String, HttpBindi
 /// HTTP GET request trait
 pub trait HttpGet<Body, Acc, S>
 where
-    Body: From<StreamingBody>,
+    Body: FromStreamingBody,
 {
     fn get<F>(self, f: F) -> impl Future<Output = IoResult<(Body, Accessor<Acc>)>>
     where
@@ -47,7 +47,7 @@ where
 
 impl<Body, S> HttpGet<Body, ResponseConn<S>, S> for ()
 where
-    Body: From<StreamingBody>,
+    Body: FromStreamingBody,
     S: Send + Sync + 'static,
 {
     async fn get<F>(self, f: F) -> IoResult<(Body, HttpAccessor<S>)>
@@ -73,7 +73,7 @@ where
     where
         F: HttpClientAsyncFn<RequestConn<S>>,
     {
-        let (_, accessor) = http_request::<_, StreamingBody, F, S>(f, Method::HEAD, ()).await?;
+        let (_, accessor) = http_request::<_, (), F, S>(f, Method::HEAD, ()).await?;
         Ok(accessor)
     }
 }
@@ -81,7 +81,7 @@ where
 /// HTTP DELETE request trait
 pub trait HttpDelete<Body, Acc, S>
 where
-    Body: From<StreamingBody>,
+    Body: FromStreamingBody,
 {
     fn delete<F>(self, f: F) -> impl Future<Output = IoResult<(Body, Accessor<Acc>)>>
     where
@@ -90,7 +90,7 @@ where
 
 impl<Body, S> HttpDelete<Body, ResponseConn<S>, S> for ()
 where
-    Body: From<StreamingBody>,
+    Body: FromStreamingBody,
     S: Send + Sync + 'static,
 {
     async fn delete<F>(self, f: F) -> IoResult<(Body, HttpAccessor<S>)>
@@ -105,7 +105,7 @@ where
 pub trait HttpPost<ReqBody, ResBody, Acc, S>
 where
     ReqBody: IntoStreamingBody,
-    ResBody: From<StreamingBody>,
+    ResBody: FromStreamingBody,
 {
     fn post<F>(self, f: F) -> impl Future<Output = IoResult<(ResBody, Accessor<Acc>)>>
     where
@@ -115,7 +115,7 @@ where
 impl<ReqBody, ResBody, S> HttpPost<ReqBody, ResBody, ResponseConn<S>, S> for ReqBody
 where
     ReqBody: IntoStreamingBody,
-    ResBody: From<StreamingBody>,
+    ResBody: FromStreamingBody,
     S: Send + Sync + 'static,
 {
     async fn post<F>(self, f: F) -> IoResult<(ResBody, HttpAccessor<S>)>
@@ -130,7 +130,7 @@ where
 pub trait HttpPut<ReqBody, ResBody, Acc, S>
 where
     ReqBody: IntoStreamingBody,
-    ResBody: From<StreamingBody>,
+    ResBody: FromStreamingBody,
 {
     fn put<F>(self, f: F) -> impl Future<Output = IoResult<(ResBody, Accessor<Acc>)>>
     where
@@ -140,7 +140,7 @@ where
 impl<ReqBody, ResBody, S> HttpPut<ReqBody, ResBody, ResponseConn<S>, S> for ReqBody
 where
     ReqBody: IntoStreamingBody,
-    ResBody: From<StreamingBody>,
+    ResBody: FromStreamingBody,
     S: Send + Sync + 'static,
 {
     async fn put<F>(self, f: F) -> IoResult<(ResBody, HttpAccessor<S>)>
@@ -155,7 +155,7 @@ where
 pub trait HttpPatch<ReqBody, ResBody, Acc, S>
 where
     ReqBody: IntoStreamingBody,
-    ResBody: From<StreamingBody>,
+    ResBody: FromStreamingBody,
 {
     fn patch<F>(self, f: F) -> impl Future<Output = IoResult<(ResBody, Accessor<Acc>)>>
     where
@@ -165,7 +165,7 @@ where
 impl<ReqBody, ResBody, S> HttpPatch<ReqBody, ResBody, ResponseConn<S>, S> for ReqBody
 where
     ReqBody: IntoStreamingBody,
-    ResBody: From<StreamingBody>,
+    ResBody: FromStreamingBody,
     S: Send + Sync + 'static,
 {
     async fn patch<F>(self, f: F) -> IoResult<(ResBody, HttpAccessor<S>)>
@@ -184,7 +184,7 @@ async fn http_request<ReqBody, ResBody, F, S>(
 ) -> IoResult<(ResBody, Accessor<ResponseConn<S>>)>
 where
     ReqBody: IntoStreamingBody,
-    ResBody: From<StreamingBody>,
+    ResBody: FromStreamingBody,
     F: HttpClientAsyncFn<RequestConn<S>>,
     S: Send + Sync + 'static,
 {
@@ -252,7 +252,10 @@ where
             Ok(Ok((response_body, status, response_headers))) => {
                 // Build ResponseConn
                 let response_conn: ResponseConn<S> = (uri, status, response_headers, state).into();
-                return Ok((response_body.into(), response_conn.into()));
+                return Ok((
+                    ResBody::from_streaming_body(response_body).await,
+                    response_conn.into(),
+                ));
             }
             Ok(Err(e)) => {
                 last_error = Some(e);

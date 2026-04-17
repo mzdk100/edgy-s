@@ -11,12 +11,91 @@ use {
     std::{
         fmt::Debug,
         io::{Error as IoError, Result as IoResult},
+        mem::take,
         pin::Pin,
         sync::Arc,
-        task::{Context, Poll, Waker},
+        task::{Context, Poll},
     },
     tracing::error,
 };
+
+enum VecU8Future {
+    Bytes {
+        bytes: Option<Bytes>,
+    },
+    Incoming {
+        incoming: Arc<RwLock<Incoming>>,
+        all_data: Vec<u8>,
+    },
+    Stream {
+        stream: Arc<RwLock<Pin<Box<dyn Stream<Item = Bytes> + Send + Sync>>>>,
+        all_data: Vec<u8>,
+    },
+}
+
+impl Default for VecU8Future {
+    fn default() -> Self {
+        Self::Bytes { bytes: None }
+    }
+}
+
+impl Future for VecU8Future {
+    type Output = Vec<u8>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        match this {
+            Self::Incoming { incoming, all_data } => {
+                let mut incoming = incoming.write();
+
+                if incoming.is_end_stream() {
+                    return Poll::Ready(take(all_data));
+                }
+
+                match Pin::new(&mut *incoming).poll_frame(cx) {
+                    Poll::Ready(Some(Ok(frame))) => {
+                        match frame.into_data() {
+                            Ok(data) => all_data.extend_from_slice(&data),
+
+                            Err(e) => {
+                                error!(?e, "Failed to get data");
+                                return Poll::Ready(take(all_data));
+                            }
+                        }
+                        cx.waker().wake_by_ref();
+                        Poll::Pending
+                    }
+                    Poll::Ready(Some(Err(e))) => {
+                        error!(?e, "Failed to get frame");
+                        Poll::Ready(take(all_data))
+                    }
+                    Poll::Ready(None) => Poll::Ready(take(all_data)),
+                    Poll::Pending => Poll::Pending,
+                }
+            }
+            Self::Stream { stream, all_data } => {
+                let mut stream = stream.write();
+
+                match stream.as_mut().poll_next(cx) {
+                    Poll::Ready(Some(data)) => {
+                        all_data.extend_from_slice(&data);
+                        cx.waker().wake_by_ref();
+                        Poll::Pending
+                    }
+                    Poll::Ready(None) => Poll::Ready(take(all_data)),
+                    Poll::Pending => Poll::Pending,
+                }
+            }
+            Self::Bytes { bytes } => {
+                if let Some(bytes) = bytes.take() {
+                    Poll::Ready(bytes.to_vec())
+                } else {
+                    Poll::Ready(Default::default())
+                }
+            }
+        }
+    }
+}
 
 /// A streaming body type that can represent various HTTP body sources.
 ///
@@ -69,50 +148,19 @@ impl Debug for StreamingBody {
 }
 
 impl StreamingBody {
-    fn into_vec(self) -> Vec<u8> {
-        let mut ret = Vec::new();
-        let mut cx = Context::from_waker(Waker::noop());
+    fn into_vec(self) -> VecU8Future {
         match self {
-            StreamingBody::Null => (),
-            StreamingBody::Bytes { bytes } => {
-                if let Some(data) = bytes {
-                    ret.extend_from_slice(&data)
-                }
-            }
-            StreamingBody::Incoming { incoming } => {
-                let mut incoming = incoming.write();
-                while !incoming.is_end_stream() {
-                    match Pin::new(&mut *incoming).poll_frame(&mut cx) {
-                        Poll::Ready(Some(Ok(frame))) => match frame.into_data() {
-                            Ok(data) => ret.extend_from_slice(&data),
-                            Err(e) => error!(?e, "Failed to get data"),
-                        },
-                        Poll::Pending => {
-                            cx.waker().wake_by_ref();
-                            continue;
-                        }
-                        Poll::Ready(Some(Err(e))) => {
-                            error!(?e, "Failed to get frame");
-                            break;
-                        }
-                        Poll::Ready(None) => break,
-                    }
-                }
-            }
-            StreamingBody::Stream { stream } => loop {
-                let mut stream = stream.write();
-                match stream.as_mut().poll_next(&mut cx) {
-                    Poll::Ready(Some(data)) => ret.extend_from_slice(&data),
-                    Poll::Ready(None) => break,
-                    Poll::Pending => {
-                        cx.waker().wake_by_ref();
-                        continue;
-                    }
-                }
+            Self::Null => VecU8Future::Bytes { bytes: None },
+            Self::Bytes { bytes } => VecU8Future::Bytes { bytes },
+            Self::Incoming { incoming } => VecU8Future::Incoming {
+                incoming: incoming.clone(),
+                all_data: Default::default(),
+            },
+            Self::Stream { stream } => VecU8Future::Stream {
+                stream: stream.clone(),
+                all_data: Default::default(),
             },
         }
-
-        ret
     }
 }
 
@@ -225,34 +273,35 @@ impl IntoStreamingBody for () {
     }
 }
 
-impl From<StreamingBody> for String {
-    fn from(value: StreamingBody) -> Self {
-        String::from_utf8(value.into_vec()).unwrap_or_default()
+/// Trait for types that can be converted from a `StreamingBody`.
+///
+/// Implemented for common types like `String`, `Vec<u8>`, `Bytes`,
+pub trait FromStreamingBody {
+    fn from_streaming_body(body: StreamingBody) -> impl Future<Output = Self> + Send;
+}
+
+impl FromStreamingBody for String {
+    async fn from_streaming_body(body: StreamingBody) -> Self {
+        String::from_utf8(body.into_vec().await).unwrap_or_default()
     }
 }
 
-impl From<StreamingBody> for Vec<u8> {
-    fn from(value: StreamingBody) -> Self {
-        value.into_vec()
+impl FromStreamingBody for Vec<u8> {
+    async fn from_streaming_body(body: StreamingBody) -> Self {
+        body.into_vec().await
     }
 }
 
-impl From<StreamingBody> for () {
-    fn from(_value: StreamingBody) -> Self {}
+impl FromStreamingBody for () {
+    async fn from_streaming_body(_: StreamingBody) -> Self {}
 }
 
-impl From<()> for StreamingBody {
-    fn from(_value: ()) -> Self {
-        StreamingBody::Null
-    }
-}
-
-impl<T> From<StreamingBody> for Pin<Box<dyn Stream<Item = IoResult<T>> + Send + Sync>>
+impl<'a, T> FromStreamingBody for Pin<Box<dyn Stream<Item = IoResult<T>> + Send + Sync + 'a>>
 where
     T: FromBytes,
 {
-    fn from(value: StreamingBody) -> Self {
-        Box::pin(value.map(|i| i.map(FromBytes::from)))
+    async fn from_streaming_body(body: StreamingBody) -> Self {
+        Box::pin(body.map(|i| i.map(FromBytes::from)))
     }
 }
 
@@ -283,8 +332,8 @@ impl IntoStreamingBody for Value {
 }
 
 #[cfg(feature = "serde_json")]
-impl From<StreamingBody> for Value {
-    fn from(value: StreamingBody) -> Self {
-        from_slice(&value.into_vec()).unwrap_or_default()
+impl FromStreamingBody for Value {
+    async fn from_streaming_body(body: StreamingBody) -> Self {
+        from_slice(&body.into_vec().await).unwrap_or_default()
     }
 }

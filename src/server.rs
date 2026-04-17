@@ -7,8 +7,8 @@ mod handler;
 
 use {
     super::types::{
-        Accessor, HttpServerAsyncFn, HttpServerRouter, IntoStreamingBody, Packet, State,
-        StreamingBody, WsAsyncFn, WsRouter,
+        Accessor, FromStreamingBody, HttpServerAsyncFn, HttpServerRouter, IntoStreamingBody,
+        Packet, State, StreamingBody, WsAsyncFn, WsRouter,
     },
     binding::{HttpBinding, WsBinding},
     builder::EdgyServiceBuilder,
@@ -206,7 +206,7 @@ where
     async fn add_route<F, P, Body, Ret>(&self, path: P, handler: F) -> IoResult<Self::Binding>
     where
         F: HttpServerAsyncFn<Body, Ret, HttpConn<S>, S>,
-        Body: From<StreamingBody>,
+        Body: FromStreamingBody,
         P: AsRef<str>,
         Ret: IntoStreamingBody,
     {
@@ -242,7 +242,7 @@ where
     async fn add_default_route<F, Body, Ret>(&self, handler: F) -> IoResult<Self::Binding>
     where
         F: HttpServerAsyncFn<Body, Ret, HttpConn<S>, S>,
-        Body: From<StreamingBody>,
+        Body: FromStreamingBody,
         Ret: IntoStreamingBody,
     {
         let (req_tx, task) = Self::spawn_http_handler(handler, &self.state, &self.rt);
@@ -331,7 +331,7 @@ impl<S> EdgyService<S> {
     ) -> (HttpReqSender, JoinHandle<()>)
     where
         F: HttpServerAsyncFn<Body, Ret, HttpConn<S>, S>,
-        Body: From<StreamingBody>,
+        Body: FromStreamingBody,
         Ret: IntoStreamingBody,
         S: Send + Sync + 'static,
     {
@@ -355,8 +355,10 @@ impl<S> EdgyService<S> {
                     HttpConn::from((uri, addr, headers, state, headers_tx, status_tx)).into();
 
                 let (abort_handle, abort_registration) = AbortHandle::new_pair();
-                let abortable_future =
-                    Abortable::new(handler.call(accessor, body.into()), abort_registration);
+                let abortable_future = Abortable::new(
+                    handler.call(accessor, Body::from_streaming_body(body).await),
+                    abort_registration,
+                );
 
                 let ret = select! {
                     biased;

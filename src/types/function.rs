@@ -1,7 +1,7 @@
 #[cfg(feature = "client")]
 use super::HttpClientRouter;
 #[cfg(feature = "server")]
-use super::{HttpServerRouter, IntoStreamingBody, StreamingBody};
+use super::{FromStreamingBody, HttpServerRouter, IntoStreamingBody};
 use {
     super::{super::get_path, Accessor, WsRouter},
     serde::{Deserialize, Serialize},
@@ -122,7 +122,7 @@ where
     where
         R: HttpServerRouter<Acc, S>,
         P: AsRef<str> + Send + Sync + 'static,
-        Body: From<StreamingBody>,
+        Body: FromStreamingBody,
         Ret: IntoStreamingBody,
     {
         router.add_route::<_, _, Body, Ret>(path, self)
@@ -131,7 +131,7 @@ where
     fn bind_as_response<R>(self, router: &R) -> impl Future<Output = IoResult<R::Binding>>
     where
         R: HttpServerRouter<Acc, S>,
-        Body: From<StreamingBody>,
+        Body: FromStreamingBody,
         Ret: IntoStreamingBody,
     {
         router.add_route::<_, _, Body, Ret>(get_path::<Self>(), self)
@@ -145,7 +145,7 @@ where
     fn bind_as_default<R>(self, router: &R) -> impl Future<Output = IoResult<R::Binding>>
     where
         R: HttpServerRouter<Acc, S>,
-        Body: From<StreamingBody>,
+        Body: FromStreamingBody,
         Ret: IntoStreamingBody,
     {
         router.add_default_route::<_, Body, Ret>(self)
