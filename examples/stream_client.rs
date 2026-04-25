@@ -1,7 +1,7 @@
 use {
     async_stream::stream,
     edgy_s::{
-        Binding, HttpClientAsyncFn,
+        Binding, FramedBox, HttpClientAsyncFn,
         client::{EdgyClient, HttpGet, HttpPost, RequestAccessor},
     },
     futures_util::{Stream, StreamExt},
@@ -27,7 +27,7 @@ async fn main() -> anyhow::Result<()> {
 
     tokio::spawn(async {
         let (mut stream, accessor): (
-            Pin<Box<dyn Stream<Item = IoResult<String>> + Send + Sync>>,
+            FramedBox<dyn Stream<Item = IoResult<String>> + Send + Sync>,
             _,
         ) = ().get(countdown).await?;
         println!("countdown({}): stream receiving", accessor.status());

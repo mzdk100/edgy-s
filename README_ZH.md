@@ -22,7 +22,7 @@
 
 ```toml
 [dependencies]
-edgy-s = { version = "1.3", features = ["server", "client"] }
+edgy-s = { version = "1.4", features = ["server", "client"] }
 ```
 
 ## 快速开始
@@ -324,7 +324,7 @@ binding
 
 ```toml
 [dependencies]
-edgy-s = { version = "1.3", features = ["server", "client", "req_id_u32"] }
+edgy-s = { version = "1.4", features = ["server", "client", "req_id_u32"] }
 ```
 
 ## 序列化后端配置
@@ -340,15 +340,15 @@ edgy-s = { version = "1.3", features = ["server", "client", "req_id_u32"] }
 ```toml
 # 默认：postcard（最紧凑）
 [dependencies]
-edgy-s = { version = "1.3", features = ["server", "client"] }
+edgy-s = { version = "1.4", features = ["server", "client"] }
 
 # 使用 CBOR 标准二进制格式
 [dependencies]
-edgy-s = { version = "1.3", features = ["server", "client", "cbor4"] }
+edgy-s = { version = "1.4", features = ["server", "client", "cbor4"] }
 
 # 使用 JSON 人类可读格式
 [dependencies]
-edgy-s = { version = "1.3", features = ["server", "client", "serde_json"] }
+edgy-s = { version = "1.4", features = ["server", "client", "serde_json"] }
 ```
 
 **注意**：如果启用了多个序列化特性，将使用优先级最高的（postcard > cbor4 > serde_json）。必须至少启用一种序列化后端。
@@ -480,6 +480,94 @@ async fn chat_handler(_accessor: WsAccessor<()>, msg: String) -> String {
     "ack".into()
 }
 ```
+
+## 流式帧协议 (FramedBox)
+
+使用流式响应（`Pin<Box<dyn Stream<Item = T>>>`）时，HTTP chunk 边界不一定与单个 stream item 对齐——一个 chunk 可能包含多个 item，或一个 item 跨越多个 chunk。这会导致 `serde_json::Value` 等结构化类型的反序列化失败。
+
+`FramedBox` 通过为每个 stream item 添加长度前缀帧来解决这个问题，确保无论 HTTP 传输行为如何，item 边界始终正确。
+
+### 传输格式
+
+当 `N ≠ ()` 时，每个 item 编码为：
+
+```
+[N 字节: item 长度（大端序）][长度 字节: item 数据]
+```
+
+`N` 类型参数（默认 `u16`）控制前缀大小：
+
+| N    | 前缀大小 | 最大 Item 大小 | 适用场景 |
+|------|----------|---------------|----------|
+| `u8` | 1 字节   | 255 B         | 极小 item |
+| `u16`| 2 字节   | 65,535 B（约 64 KB） | **默认**，适用于大多数场景 |
+| `u32`| 4 字节   | 约 4 GB       | 大型 item |
+| `u64`| 8 字节   | 约 18 EB      | 极端场景 |
+| `()` | 0 字节   | —             | 原始模式（无帧，每个 chunk = 一个 item） |
+
+### 服务端（返回帧流）
+
+```rust
+use edgy_s::{
+    FramedBox, HttpServerAsyncFn, server::HttpAccessor,
+    serde_json::{json, Value}
+};
+use async_stream::stream;
+use futures_util::Stream;
+
+// 默认：2 字节长度前缀
+async fn framed_handler(_accessor: HttpAccessor, _body: String) -> FramedBox<impl Stream<Item = Value>> {
+    FramedBox::pin(stream! {
+        yield json!({"event": "start"});
+        yield json!({"event": "data", "value": 42});
+        yield json!({"event": "end"});
+    })
+}
+
+// 大型 item：4 字节前缀
+async fn large_handler(_accessor: HttpAccessor, _body: String) -> FramedBox<impl Stream<Item = Value>, u32> {
+    FramedBox::pin(stream! {
+        yield json!({"large_payload": "..."});
+    })
+}
+
+// 原始模式：无帧（等价于 Pin<Box<S>>）
+async fn raw_handler(_accessor: HttpAccessor, _body: String) -> FramedBox<impl Stream<Item = String>, ()> {
+    FramedBox::pin(stream! {
+        yield "chunk1";
+        yield "chunk2";
+    })
+}
+```
+
+### 客户端（接收帧流）
+
+```rust
+use edgy_s::{
+    FramedBox, HttpGet, HttpClientAsyncFn,
+    serde_json::Value
+};
+use futures_util::{Stream, StreamExt};
+use std::io::Result as IoResult;
+
+// 默认：2 字节长度前缀（必须与服务端的 N 匹配）
+let (mut stream, _): (
+    FramedBox<dyn Stream<Item = IoResult<Value>> + Send + Sync>,
+    _,
+) = ().get(handler).await?;
+
+while let Some(item) = stream.next().await {
+    println!("{:?}", item?);
+}
+
+// 4 字节前缀
+let (mut stream, _): (
+    FramedBox<dyn Stream<Item = IoResult<Value>> + Send + Sync, u32>,
+    _,
+) = ().get(large_handler).await?;
+```
+
+> **重要**：客户端的 `N` 类型必须与服务端匹配，否则会导致帧解析错误。
 
 ## 特性开关
 

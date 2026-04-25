@@ -22,7 +22,7 @@ A minimalist WebSocket/HTTP bidirectional RPC framework for building complex mic
 
 ```toml
 [dependencies]
-edgy-s = { version = "1.3", features = ["server", "client"] }
+edgy-s = { version = "1.4", features = ["server", "client"] }
 ```
 
 ## Quick Start
@@ -324,7 +324,7 @@ Choose the appropriate request ID width based on your concurrency needs:
 
 ```toml
 [dependencies]
-edgy-s = { version = "1.3", features = ["server", "client", "req_id_u32"] }
+edgy-s = { version = "1.4", features = ["server", "client", "req_id_u32"] }
 ```
 
 ## Serialization Backend Configuration
@@ -340,15 +340,15 @@ Choose one serialization backend based on your needs. The priority is: `postcard
 ```toml
 # Default: postcard (most compact)
 [dependencies]
-edgy-s = { version = "1.3", features = ["server", "client"] }
+edgy-s = { version = "1.4", features = ["server", "client"] }
 
 # Use CBOR for standard binary format
 [dependencies]
-edgy-s = { version = "1.3", features = ["server", "client", "cbor4"] }
+edgy-s = { version = "1.4", features = ["server", "client", "cbor4"] }
 
 # Use JSON for human-readable output
 [dependencies]
-edgy-s = { version = "1.3", features = ["server", "client", "serde_json"] }
+edgy-s = { version = "1.4", features = ["server", "client", "serde_json"] }
 ```
 
 **Note**: If multiple serialization features are enabled, the highest priority one will be used (postcard > cbor4 > serde_json). At least one serialization backend must be enabled.
@@ -480,6 +480,94 @@ async fn chat_handler(_accessor: WsAccessor<()>, msg: String) -> String {
     "ack".into()
 }
 ```
+
+## Streaming Framing (FramedBox)
+
+When using streaming responses (`Pin<Box<dyn Stream<Item = T>>>`), HTTP chunk boundaries do not necessarily align with individual stream items — a single chunk may contain multiple items, or an item may span multiple chunks. This causes deserialization failures for structured types like `serde_json::Value`.
+
+`FramedBox` solves this by adding a length-prefix frame to each stream item, ensuring correct item boundaries regardless of HTTP transport behavior.
+
+### Wire Format
+
+When `N ≠ ()`, each item is encoded as:
+
+```
+[N bytes: item length in big-endian][length bytes: item data]
+```
+
+The `N` type parameter (default `u16`) controls the prefix size:
+
+| N    | Prefix Size | Max Item Size | Use Case |
+|------|-------------|---------------|----------|
+| `u8` | 1 byte      | 255 B         | Tiny items |
+| `u16`| 2 bytes     | 65,535 B (~64 KB) | **Default**, suitable for most cases |
+| `u32`| 4 bytes     | ~4 GB         | Large items |
+| `u64`| 8 bytes     | ~18 EB        | Extreme cases |
+| `()` | 0 bytes     | —             | Raw mode (no framing, each chunk = one item) |
+
+### Server-side (Returning Framed Streams)
+
+```rust
+use edgy_s::{
+    FramedBox, HttpServerAsyncFn, server::HttpAccessor,
+    serde_json::{json, Value}
+};
+use async_stream::stream;
+use futures_util::Stream;
+
+// Default: 2-byte length prefix
+async fn framed_handler(_accessor: HttpAccessor, _body: String) -> FramedBox<impl Stream<Item = Value>> {
+    FramedBox::pin(stream! {
+        yield json!({"event": "start"});
+        yield json!({"event": "data", "value": 42});
+        yield json!({"event": "end"});
+    })
+}
+
+// Large items: 4-byte prefix
+async fn large_handler(_accessor: HttpAccessor, _body: String) -> FramedBox<impl Stream<Item = Value>, u32> {
+    FramedBox::pin(stream! {
+        yield json!({"large_payload": "..."});
+    })
+}
+
+// Raw mode: no framing (equivalent to Pin<Box<S>>)
+async fn raw_handler(_accessor: HttpAccessor, _body: String) -> FramedBox<impl Stream<Item = String>, ()> {
+    FramedBox::pin(stream! {
+        yield "chunk1";
+        yield "chunk2";
+    })
+}
+```
+
+### Client-side (Receiving Framed Streams)
+
+```rust
+use edgy_s::{
+    FramedBox, HttpGet, HttpClientAsyncFn,
+    serde_json::Value
+};
+use futures_util::{Stream, StreamExt};
+use std::io::Result as IoResult;
+
+// Default: 2-byte length prefix (must match server's N)
+let (mut stream, _): (
+    FramedBox<dyn Stream<Item = IoResult<Value>> + Send + Sync>,
+    _,
+) = ().get(handler).await?;
+
+while let Some(item) = stream.next().await {
+    println!("{:?}", item?);
+}
+
+// 4-byte prefix
+let (mut stream, _): (
+    FramedBox<dyn Stream<Item = IoResult<Value>> + Send + Sync, u32>,
+    _,
+) = ().get(large_handler).await?;
+```
+
+> **Important**: The `N` type on the client side must match the server side. A mismatch will cause frame parsing errors.
 
 ## Feature Flags
 

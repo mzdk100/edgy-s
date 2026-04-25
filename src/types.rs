@@ -1,5 +1,6 @@
 mod accessor;
 mod bytes;
+mod frame;
 mod function;
 mod packet;
 mod router;
@@ -8,6 +9,7 @@ mod stream;
 pub use {
     accessor::*,
     bytes::*,
+    frame::*,
     function::*,
     hyper::{StatusCode, Uri},
     packet::*,

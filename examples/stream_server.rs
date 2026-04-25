@@ -1,7 +1,7 @@
 use {
     async_stream::stream,
     edgy_s::{
-        Binding, HttpServerAsyncFn,
+        Binding, FramedBox, HttpServerAsyncFn,
         server::{EdgyService, HttpAccessor},
     },
     futures_util::{Stream, StreamExt},
@@ -32,13 +32,16 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn countdown(_accessor: HttpAccessor, _body: String) -> Pin<Box<impl Stream<Item = String>>> {
+async fn countdown(
+    _accessor: HttpAccessor,
+    _body: String,
+) -> FramedBox<impl Stream<Item = String>> {
     let from = _accessor
         .get_argument("from")
         .and_then(|i| i.parse().ok())
         .unwrap_or(10u8);
 
-    Box::pin(stream! {
+    FramedBox::pin(stream! {
         yield format!("<p>Countdown from {}</p><br>", from);
         for i in (0..from).rev() {
             sleep(Duration::from_secs(1)).await;

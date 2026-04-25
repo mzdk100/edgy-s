@@ -1,7 +1,7 @@
 #[cfg(feature = "serde_json")]
 use serde_json::{Value, from_slice, to_vec};
 use {
-    super::{FromBytes, IntoBytes},
+    super::{FrameLen, FramedBox, FromBytes, IntoBytes},
     futures_util::{Stream, StreamExt},
     hyper::{
         Error,
@@ -10,7 +10,8 @@ use {
     parking_lot::RwLock,
     std::{
         fmt::Debug,
-        io::{Error as IoError, Result as IoResult},
+        io::{Error as IoError, ErrorKind, Result as IoResult},
+        marker::PhantomData,
         mem::take,
         pin::Pin,
         sync::Arc,
@@ -258,11 +259,11 @@ impl IntoStreamingBody for Bytes {
 impl<S, T> IntoStreamingBody for Pin<Box<S>>
 where
     S: Stream<Item = T> + Send + Sync + 'static,
-    T: IntoBytes,
+    T: IntoBytes + 'static,
 {
     fn into_streaming_body(self) -> StreamingBody {
         StreamingBody::Stream {
-            stream: Arc::new(RwLock::new(Box::pin(self.map(|i| i.into())))),
+            stream: Arc::new(RwLock::new(Box::pin(self.map(IntoBytes::into)))),
         }
     }
 }
@@ -305,6 +306,20 @@ where
     }
 }
 
+impl<'a, T, N> FromStreamingBody for FramedBox<dyn Stream<Item = IoResult<T>> + Send + Sync + 'a, N>
+where
+    T: FromBytes + 'a,
+    N: FrameLen + 'a,
+{
+    async fn from_streaming_body(body: StreamingBody) -> Self {
+        Self::new(Box::pin(FramedStream::<T, N> {
+            body,
+            buffer: Vec::new(),
+            _marker: PhantomData,
+        }))
+    }
+}
+
 impl Stream for StreamingBody {
     type Item = IoResult<Bytes>;
 
@@ -335,5 +350,69 @@ impl IntoStreamingBody for Value {
 impl FromStreamingBody for Value {
     async fn from_streaming_body(body: StreamingBody) -> Self {
         from_slice(&body.into_vec().await).unwrap_or_default()
+    }
+}
+
+/// A stream that parses length-prefixed frames from a `StreamingBody`.
+///
+/// Wire format: `[size_of::<N>() bytes: length in big-endian][length bytes: data]`
+/// When `N = ()`, each chunk is passed through directly (raw mode).
+struct FramedStream<T, N> {
+    body: StreamingBody,
+    buffer: Vec<u8>,
+    _marker: PhantomData<fn() -> (T, N)>,
+}
+
+impl<T, N> Stream for FramedStream<T, N>
+where
+    T: FromBytes,
+    N: FrameLen,
+{
+    type Item = IoResult<T>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+
+        // Raw mode: no length prefix, each chunk is one item
+        if size_of::<N>() == 0 {
+            return match Pin::new(&mut this.body).poll_next(cx) {
+                Poll::Ready(Some(Ok(bytes))) => Poll::Ready(Some(Ok(FromBytes::from(bytes)))),
+                Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e))),
+                Poll::Ready(None) => Poll::Ready(None),
+                Poll::Pending => Poll::Pending,
+            };
+        }
+
+        // Framed mode: parse length-prefixed frames
+        // Try to parse a complete frame from the buffer
+        if let Some(len) = N::decode_len(&this.buffer)
+            && this.buffer.len() >= size_of::<N>() + len
+        {
+            this.buffer.drain(0..size_of::<N>());
+            let data = this.buffer.drain(0..len).collect::<Vec<_>>();
+            return Poll::Ready(Some(Ok(FromBytes::from(Bytes::from(data)))));
+        }
+
+        // Need more data — poll the inner StreamingBody once
+        match Pin::new(&mut this.body).poll_next(cx) {
+            Poll::Ready(Some(Ok(bytes))) => {
+                this.buffer.extend_from_slice(&bytes);
+                // Schedule a re-poll so the buffer is re-checked on next wake
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+            Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e))),
+            Poll::Ready(None) => {
+                if this.buffer.is_empty() {
+                    Poll::Ready(None)
+                } else {
+                    Poll::Ready(Some(Err(IoError::new(
+                        ErrorKind::UnexpectedEof,
+                        "stream ended with incomplete frame",
+                    ))))
+                }
+            }
+            Poll::Pending => Poll::Pending,
+        }
     }
 }
